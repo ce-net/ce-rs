@@ -299,9 +299,52 @@ impl CeClient {
     }
 
     /// Snapshot of recently-received app messages (`GET /mesh/messages`). For reliable delivery
-    /// subscribe to the SSE stream instead; this ring is best-effort and capped.
+    /// subscribe to the SSE stream instead; this ring is best-effort and capped. Received pub/sub
+    /// messages and incoming requests appear here too (the latter carry a `reply_token`).
     pub async fn messages(&self) -> Result<Vec<AppMessage>> {
         json(self.http.get(self.url("/mesh/messages")).send().await?).await
+    }
+
+    /// Subscribe to an app pub/sub topic so this node receives its messages (`POST
+    /// /mesh/subscribe`). Idempotent; lasts for the node's lifetime.
+    pub async fn subscribe(&self, topic: &str) -> Result<()> {
+        let body = serde_json::json!({ "topic": topic });
+        ok(self.http.post(self.url("/mesh/subscribe")).json(&body).send().await?).await
+    }
+
+    /// Publish a signed message to an app pub/sub topic (`POST /mesh/publish`). The node signs it
+    /// (subscribers verify authorship) and broadcasts it to everyone subscribed to `topic`.
+    pub async fn publish(&self, topic: &str, payload: &[u8]) -> Result<()> {
+        let body = serde_json::json!({ "topic": topic, "payload_hex": hex::encode(payload) });
+        ok(self.http.post(self.url("/mesh/publish")).json(&body).send().await?).await
+    }
+
+    /// Send a request to a node and wait for its app's reply (`POST /mesh/request`). The peer's app
+    /// answers via [`reply`](Self::reply); this returns the reply payload, or errors on timeout.
+    pub async fn request(
+        &self,
+        to: &str,
+        topic: &str,
+        payload: &[u8],
+        timeout_ms: u64,
+    ) -> Result<Vec<u8>> {
+        let body = serde_json::json!({
+            "to": to,
+            "topic": topic,
+            "payload_hex": hex::encode(payload),
+            "timeout_ms": timeout_ms,
+        });
+        let v: serde_json::Value =
+            json(self.http.post(self.url("/mesh/request")).json(&body).send().await?).await?;
+        let hexs = v["payload_hex"].as_str().unwrap_or_default();
+        hex::decode(hexs).map_err(|e| anyhow!("bad reply payload hex: {e}"))
+    }
+
+    /// Answer an incoming request, identified by the `reply_token` on its [`AppMessage`] (`POST
+    /// /mesh/reply`). The reply is routed back to the original requester's [`request`](Self::request).
+    pub async fn reply(&self, token: u64, payload: &[u8]) -> Result<()> {
+        let body = serde_json::json!({ "token": token, "payload_hex": hex::encode(payload) });
+        ok(self.http.post(self.url("/mesh/reply")).json(&body).send().await?).await
     }
 
     /// Stop a job on a specific remote host (`POST /mesh-kill`).
@@ -478,6 +521,9 @@ pub struct AppMessage {
     pub payload_hex: String,
     /// Unix seconds when the local node received it.
     pub received_at: u64,
+    /// Set when this is a request expecting a reply: pass it to [`CeClient::reply`](crate::CeClient::reply).
+    #[serde(default)]
+    pub reply_token: Option<u64>,
 }
 
 impl AppMessage {
