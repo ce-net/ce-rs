@@ -347,6 +347,45 @@ impl CeClient {
         ok(self.http.post(self.url("/mesh/reply")).json(&body).send().await?).await
     }
 
+    // ----- naming + discovery -----
+
+    /// Claim a unique human-readable name for this node (`POST /names/claim`). Takes effect once
+    /// mined; first claim wins. Name: 3–32 chars, lowercase `a-z` / `0-9` / hyphen.
+    pub async fn claim_name(&self, name: &str) -> Result<()> {
+        let body = serde_json::json!({ "name": name });
+        ok(self.http.post(self.url("/names/claim")).json(&body).send().await?).await
+    }
+
+    /// Resolve a claimed name to its owner's NodeId hex (`GET /names/:name`); `None` if unclaimed.
+    pub async fn resolve_name(&self, name: &str) -> Result<Option<String>> {
+        let resp = self.http.get(self.url(&format!("/names/{name}"))).send().await?;
+        if resp.status().as_u16() == 404 {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            return Err(anyhow!("CE API {}: resolve failed", resp.status()));
+        }
+        let v: serde_json::Value = resp.json().await?;
+        Ok(v["node_id"].as_str().map(|s| s.to_string()))
+    }
+
+    /// Advertise that this node provides a named service, discoverable via the DHT (`POST
+    /// /discovery/advertise`). Re-call periodically — provider records expire.
+    pub async fn advertise_service(&self, service: &str) -> Result<()> {
+        let body = serde_json::json!({ "service": service });
+        ok(self.http.post(self.url("/discovery/advertise")).json(&body).send().await?).await
+    }
+
+    /// Find the NodeId hexes of nodes advertising a named service (`GET /discovery/find/:service`).
+    pub async fn find_service(&self, service: &str) -> Result<Vec<String>> {
+        let v: serde_json::Value =
+            json(self.http.get(self.url(&format!("/discovery/find/{service}"))).send().await?).await?;
+        Ok(v["providers"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .unwrap_or_default())
+    }
+
     /// Stop a job on a specific remote host (`POST /mesh-kill`).
     pub async fn mesh_kill(&self, node_id: &str, job_id: &str, grant: Option<&str>) -> Result<()> {
         let body = serde_json::json!({ "node_id": node_id, "job_id": job_id, "grant": grant });
