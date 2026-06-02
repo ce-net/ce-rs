@@ -1,0 +1,18 @@
+[package]
+name = "ce-rs"
+version = "0.1.0"
+edition = "2024"
+description = "Rust SDK for CE — a typed async client for talking to a local CE node."
+license = "MIT"
+repository = "https://github.com/ce-net/ce-rs"
+keywords = ["ce", "distributed-compute", "p2p", "sdk"]
+categories = ["api-bindings", "network-programming"]
+
+[dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
