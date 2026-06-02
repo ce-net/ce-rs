@@ -75,6 +75,12 @@ impl CeClient {
         json(self.http.get(self.url("/atlas")).send().await?).await
     }
 
+    /// Verifiable public randomness from the PoW tip (`GET /beacon`). Seed reproducible,
+    /// auditable host selection from `beacon.hash`.
+    pub async fn beacon(&self) -> Result<Beacon> {
+        json(self.http.get(self.url("/beacon")).send().await?).await
+    }
+
     /// All jobs known to this node (`GET /jobs`).
     pub async fn jobs(&self) -> Result<Vec<Job>> {
         json(self.http.get(self.url("/jobs")).send().await?).await
@@ -257,6 +263,14 @@ impl ExecResult {
     pub fn ok(&self) -> bool {
         self.exit_code == 0
     }
+}
+
+/// Verifiable public randomness from the PoW chain tip.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Beacon {
+    pub height: u64,
+    /// Tip block hash, 64 hex chars — unpredictable and globally agreed.
+    pub hash: String,
 }
 
 /// A node's interaction history — the reputation substrate. Immutable facts from the chain;
