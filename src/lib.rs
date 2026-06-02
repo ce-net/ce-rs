@@ -85,6 +85,13 @@ impl CeClient {
         json(self.http.get(self.url(&format!("/jobs/{job_id}"))).send().await?).await
     }
 
+    /// A node's interaction history — the reputation substrate (`GET /history/:node_id`).
+    /// CE reports immutable facts (jobs hosted, heartbeats, earned/spent); the caller derives
+    /// its own per-relationship trust. Query an archive node for complete history.
+    pub async fn history(&self, node_id: &str) -> Result<NodeHistory> {
+        json(self.http.get(self.url(&format!("/history/{node_id}"))).send().await?).await
+    }
+
     // ----- economy -----
 
     /// Transfer credits to another node; returns the tx id (`POST /transfer`).
@@ -249,5 +256,35 @@ pub struct ExecResult {
 impl ExecResult {
     pub fn ok(&self) -> bool {
         self.exit_code == 0
+    }
+}
+
+/// A node's interaction history — the reputation substrate. Immutable facts from the chain;
+/// derive your own trust from them.
+#[derive(Debug, Clone, Deserialize)]
+pub struct NodeHistory {
+    pub node_id: String,
+    pub jobs_hosted: u64,
+    pub jobs_paid: u64,
+    pub heartbeats_hosted: u64,
+    pub heartbeats_paid: u64,
+    pub expiries: u64,
+    pub earned: Amount,
+    pub spent: Amount,
+    pub first_height: u64,
+    pub last_height: u64,
+}
+
+impl NodeHistory {
+    /// A node with no recorded interactions — a stranger (starts at the bottom of the
+    /// trust gradient; only watchable/redundant work).
+    pub fn is_newcomer(&self) -> bool {
+        self.first_height == 0
+    }
+
+    /// A simple default trust heuristic: total work this host delivered and was paid for
+    /// (settled jobs + heartbeats received). Higher = more proven. Apps may define their own.
+    pub fn delivered_work(&self) -> u64 {
+        self.jobs_hosted + self.heartbeats_hosted
     }
 }
