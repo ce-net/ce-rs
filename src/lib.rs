@@ -166,6 +166,39 @@ impl CeClient {
     pub async fn kill(&self, job_id: &str) -> Result<()> {
         ok(self.http.delete(self.url(&format!("/jobs/{job_id}"))).send().await?).await
     }
+
+    // ----- payment channels (docs/payment-channels.md) -----
+
+    /// Open an off-chain payment channel paying `host`, locking `capacity` (`POST /channels/open`).
+    /// Returns the channel id. `expiry_height` 0 uses the node's default lifetime.
+    pub async fn channel_open(&self, host: &str, capacity: Amount, expiry_height: u64) -> Result<String> {
+        let body = serde_json::json!({ "host": host, "capacity": capacity, "expiry_height": expiry_height });
+        let v: serde_json::Value = json(self.http.post(self.url("/channels/open")).json(&body).send().await?).await?;
+        Ok(v["channel_id"].as_str().unwrap_or_default().to_string())
+    }
+
+    /// Sign an off-chain receipt as the payer for `cumulative` total paid (`POST /channels/receipt`).
+    /// Hand the returned receipt to the host; they redeem the highest one to settle.
+    pub async fn sign_receipt(&self, channel_id: &str, host: &str, cumulative: Amount) -> Result<Receipt> {
+        let body = serde_json::json!({ "channel_id": channel_id, "host": host, "cumulative": cumulative });
+        json(self.http.post(self.url("/channels/receipt")).json(&body).send().await?).await
+    }
+
+    /// Redeem a receipt to close a channel (call on the host node) (`POST /channels/:id/close`).
+    pub async fn channel_close(&self, channel_id: &str, cumulative: Amount, payer_sig: &str) -> Result<()> {
+        let body = serde_json::json!({ "cumulative": cumulative, "payer_sig": payer_sig });
+        ok(self.http.post(self.url(&format!("/channels/{channel_id}/close"))).json(&body).send().await?).await
+    }
+
+    /// Reclaim a channel after expiry (call on the payer node) (`POST /channels/:id/expire`).
+    pub async fn channel_expire(&self, channel_id: &str) -> Result<()> {
+        ok(self.http.post(self.url(&format!("/channels/{channel_id}/expire"))).send().await?).await
+    }
+
+    /// List open payment channels (`GET /channels`).
+    pub async fn channels(&self) -> Result<Vec<Channel>> {
+        json(self.http.get(self.url("/channels")).send().await?).await
+    }
 }
 
 /// Deserialize a successful JSON response, or surface an error with status + body.
@@ -263,6 +296,25 @@ impl ExecResult {
     pub fn ok(&self) -> bool {
         self.exit_code == 0
     }
+}
+
+/// An open payment channel.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Channel {
+    pub channel_id: String,
+    pub payer: String,
+    pub host: String,
+    pub capacity: Amount,
+    pub expiry_height: u64,
+}
+
+/// A signed off-chain payment receipt (the payer authorizes `cumulative` total to the host).
+#[derive(Debug, Clone, Deserialize)]
+pub struct Receipt {
+    pub channel_id: String,
+    pub cumulative: Amount,
+    /// Payer's signature (128 hex), redeemed by the host via `channel_close`.
+    pub payer_sig: String,
 }
 
 /// Verifiable public randomness from the PoW chain tip.
