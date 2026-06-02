@@ -132,6 +132,17 @@ impl CeClient {
         Ok(v["job_id"].as_str().unwrap_or_default().to_string())
     }
 
+    /// Run a one-shot command in a sandboxed container on a **specific** host over the mesh
+    /// and return its output synchronously (`POST /mesh-exec`). This is the scatter/gather
+    /// primitive: fan a command out across hosts and collect each result.
+    ///
+    /// (v0 targets admin-trusted hosts; grant forwarding through the proxy is a pending
+    /// node-side enhancement, so this takes no grant yet.)
+    pub async fn mesh_exec(&self, node_id: &str, image: &str, cmd: &[String]) -> Result<ExecResult> {
+        let body = serde_json::json!({ "node_id": node_id, "image": image, "cmd": cmd });
+        json(self.http.post(self.url("/mesh-exec")).json(&body).send().await?).await
+    }
+
     /// Stop a job on a specific remote host (`POST /mesh-kill`).
     pub async fn mesh_kill(&self, node_id: &str, job_id: &str, grant: Option<&str>) -> Result<()> {
         let body = serde_json::json!({ "node_id": node_id, "job_id": job_id, "grant": grant });
@@ -224,5 +235,19 @@ pub struct Job {
 impl Job {
     pub fn is_running(&self) -> bool {
         self.status == "running"
+    }
+}
+
+/// Result of a one-shot [`CeClient::mesh_exec`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct ExecResult {
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: i64,
+}
+
+impl ExecResult {
+    pub fn ok(&self) -> bool {
+        self.exit_code == 0
     }
 }
