@@ -160,7 +160,10 @@ impl CeClient {
     }
 
     /// Deploy a **WASM** workload on a specific host over the mesh — the module is referenced by
-    /// its content hash (upload it first with [`put_blob`](Self::put_blob)). (`POST /mesh-deploy`)
+    /// its content hash (upload it first with [`put_blob`](Self::put_blob)). `inputs` are
+    /// content-addressed CIDs the host stages from the data layer before launch (Stage 4); pass
+    /// `&[]` for none. (`POST /mesh-deploy`)
+    #[allow(clippy::too_many_arguments)]
     pub async fn mesh_deploy_wasm(
         &self,
         node_id: &str,
@@ -171,6 +174,7 @@ impl CeClient {
         duration_secs: u64,
         bid: Amount,
         grant: Option<&str>,
+        inputs: &[&str],
     ) -> Result<String> {
         let body = serde_json::json!({
             "node_id": node_id,
@@ -181,6 +185,7 @@ impl CeClient {
             "duration_secs": duration_secs,
             "bid": bid,
             "grant": grant,
+            "inputs": inputs,
         });
         let v: serde_json::Value = json(self.http.post(self.url("/mesh-deploy")).json(&body).send().await?).await?;
         Ok(v["job_id"].as_str().unwrap_or_default().to_string())
