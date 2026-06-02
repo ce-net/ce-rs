@@ -29,6 +29,9 @@
 mod amount;
 pub use amount::{Amount, CREDIT};
 
+pub mod data;
+pub use data::{cid, Manifest};
+
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 
@@ -154,6 +157,99 @@ impl CeClient {
     pub async fn mesh_exec(&self, node_id: &str, image: &str, cmd: &[String]) -> Result<ExecResult> {
         let body = serde_json::json!({ "node_id": node_id, "image": image, "cmd": cmd });
         json(self.http.post(self.url("/mesh-exec")).json(&body).send().await?).await
+    }
+
+    /// Deploy a **WASM** workload on a specific host over the mesh — the module is referenced by
+    /// its content hash (upload it first with [`put_blob`](Self::put_blob)). (`POST /mesh-deploy`)
+    pub async fn mesh_deploy_wasm(
+        &self,
+        node_id: &str,
+        module_hash: &str,
+        entry: &str,
+        cpu_cores: u32,
+        mem_mb: u64,
+        duration_secs: u64,
+        bid: Amount,
+        grant: Option<&str>,
+    ) -> Result<String> {
+        let body = serde_json::json!({
+            "node_id": node_id,
+            "wasm_module": module_hash,
+            "wasm_entry": entry,
+            "cpu_cores": cpu_cores,
+            "mem_mb": mem_mb,
+            "duration_secs": duration_secs,
+            "bid": bid,
+            "grant": grant,
+        });
+        let v: serde_json::Value = json(self.http.post(self.url("/mesh-deploy")).json(&body).send().await?).await?;
+        Ok(v["job_id"].as_str().unwrap_or_default().to_string())
+    }
+
+    /// Upload bytes to the content-addressed blob store; returns the sha256 hash (`POST /blobs`).
+    /// Use it to publish a WASM module before deploying it by hash.
+    pub async fn put_blob(&self, bytes: Vec<u8>) -> Result<String> {
+        let v: serde_json::Value = json(self.http.post(self.url("/blobs")).body(bytes).send().await?).await?;
+        Ok(v["hash"].as_str().unwrap_or_default().to_string())
+    }
+
+    /// Fetch a blob by its content hash (`GET /blobs/:hash`).
+    pub async fn get_blob(&self, hash: &str) -> Result<Vec<u8>> {
+        let resp = self.http.get(self.url(&format!("/blobs/{hash}"))).send().await?;
+        if !resp.status().is_success() {
+            return Err(anyhow!("CE API {}: blob not found", resp.status()));
+        }
+        Ok(resp.bytes().await?.to_vec())
+    }
+
+    /// Upload an object of any size: split it into content-addressed chunks, store each via the
+    /// blob store, then store the manifest. Returns the **object CID** (the manifest's hash) —
+    /// pass it to [`get_object`](Self::get_object) to fetch the whole object back. Chunking is
+    /// client-side (see [`data`]); the node just stores opaque blobs.
+    pub async fn put_object(&self, bytes: &[u8]) -> Result<String> {
+        let (manifest, chunks) = data::chunk_object(bytes, data::DEFAULT_CHUNK_SIZE);
+        for (chunk_cid, chunk) in chunks {
+            let stored = self.put_blob(chunk).await?;
+            if stored != chunk_cid {
+                return Err(anyhow!(
+                    "blob store returned hash {stored} for chunk {chunk_cid} (hashing mismatch)"
+                ));
+            }
+        }
+        let manifest_bytes = serde_json::to_vec(&manifest)?;
+        self.put_blob(manifest_bytes).await
+    }
+
+    /// Fetch an object by its CID: resolve the manifest, pull each chunk from the blob store, and
+    /// verify every chunk against its CID before reassembling (content addressing makes this
+    /// trustless). Chunks are fetched sequentially in Stage 1; parallel multi-provider fetch is
+    /// the Stage 2 mesh refinement.
+    pub async fn get_object(&self, object_cid: &str) -> Result<Vec<u8>> {
+        let manifest_bytes = self.get_blob(object_cid).await?;
+        let manifest: data::Manifest = serde_json::from_slice(&manifest_bytes)
+            .map_err(|e| anyhow!("{object_cid} is not a v1 object manifest: {e}"))?;
+        if !manifest.is_v1() {
+            return Err(anyhow!("unsupported manifest kind: {}", manifest.kind));
+        }
+        let mut out = Vec::with_capacity(manifest.total_size as usize);
+        for chunk_cid in &manifest.chunks {
+            let chunk = self.get_blob(chunk_cid).await?;
+            let got = data::cid(&chunk);
+            if got != *chunk_cid {
+                return Err(anyhow!(
+                    "chunk verification failed: expected {chunk_cid}, got {got}"
+                ));
+            }
+            out.extend_from_slice(&chunk);
+        }
+        if out.len() as u64 != manifest.total_size {
+            return Err(anyhow!(
+                "reassembled size {} != manifest total_size {}",
+                out.len(),
+                manifest.total_size
+            ));
+        }
+        Ok(out)
     }
 
     /// Stop a job on a specific remote host (`POST /mesh-kill`).
