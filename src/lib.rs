@@ -252,6 +252,31 @@ impl CeClient {
         Ok(out)
     }
 
+    /// Paid chunk fetch (data layer Stage 3): authorise `provider` to redeem `cumulative` on
+    /// `channel_id` and pull the chunk `cid` from it over the mesh, paying as we go. `cumulative`
+    /// is the monotonic total for the channel and must cover the running cost of every chunk
+    /// fetched on it so far — the caller tracks it across fetches. Requires an open channel with
+    /// the provider. The returned bytes are verified against `cid`. (`POST /data/fetch`)
+    pub async fn fetch_chunk_paid(
+        &self,
+        provider: &str,
+        cid: &str,
+        channel_id: &str,
+        cumulative: Amount,
+    ) -> Result<Vec<u8>> {
+        let body = serde_json::json!({
+            "provider": provider,
+            "cid": cid,
+            "channel_id": channel_id,
+            "cumulative": cumulative,
+        });
+        let resp = self.http.post(self.url("/data/fetch")).json(&body).send().await?;
+        if !resp.status().is_success() {
+            return Err(anyhow!("CE API {}: paid fetch failed", resp.status()));
+        }
+        Ok(resp.bytes().await?.to_vec())
+    }
+
     /// Stop a job on a specific remote host (`POST /mesh-kill`).
     pub async fn mesh_kill(&self, node_id: &str, job_id: &str, grant: Option<&str>) -> Result<()> {
         let body = serde_json::json!({ "node_id": node_id, "job_id": job_id, "grant": grant });
