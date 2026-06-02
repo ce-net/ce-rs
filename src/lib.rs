@@ -175,7 +175,7 @@ impl CeClient {
         bid: Amount,
         grant: Option<&str>,
         inputs: &[&str],
-    ) -> Result<String> {
+    ) -> Result<Deployment> {
         let body = serde_json::json!({
             "node_id": node_id,
             "wasm_module": module_hash,
@@ -188,7 +188,10 @@ impl CeClient {
             "inputs": inputs,
         });
         let v: serde_json::Value = json(self.http.post(self.url("/mesh-deploy")).json(&body).send().await?).await?;
-        Ok(v["job_id"].as_str().unwrap_or_default().to_string())
+        Ok(Deployment {
+            job_id: v["job_id"].as_str().unwrap_or_default().to_string(),
+            output: v["output"].as_str().map(|s| s.to_string()),
+        })
     }
 
     /// Upload bytes to the content-addressed blob store; returns the sha256 hash (`POST /blobs`).
@@ -558,6 +561,16 @@ pub struct Receipt {
     pub cumulative: Amount,
     /// Payer's signature (128 hex), redeemed by the host via `channel_close`.
     pub payer_sig: String,
+}
+
+/// The result of a mesh deploy: the job id, plus an output CID when the workload ran to completion
+/// and produced a captured artifact (a WASI command's stdout — fetch it with [`CeClient::get_object`]
+/// or `get_blob`). `output` is `None` for detached/streaming cells.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Deployment {
+    pub job_id: String,
+    #[serde(default)]
+    pub output: Option<String>,
 }
 
 /// A directed application message received from a mesh peer. `from` is the cryptographically
