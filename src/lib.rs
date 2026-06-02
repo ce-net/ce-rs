@@ -386,6 +386,19 @@ impl CeClient {
             .unwrap_or_default())
     }
 
+    /// Pay a relay for relay service over the mesh (`POST /relay/pay`). Signs a payment-channel
+    /// receipt authorising `cumulative` total to the relay (the channel host) and sends it; the
+    /// relay verifies it against the channel and its price. Requires an open channel with the
+    /// relay; re-call periodically with a rising `cumulative` to keep paying for ongoing relaying.
+    pub async fn pay_relay(&self, relay: &str, channel_id: &str, cumulative: Amount) -> Result<()> {
+        let body = serde_json::json!({
+            "relay": relay,
+            "channel_id": channel_id,
+            "cumulative": cumulative,
+        });
+        ok(self.http.post(self.url("/relay/pay")).json(&body).send().await?).await
+    }
+
     /// Stop a job on a specific remote host (`POST /mesh-kill`).
     pub async fn mesh_kill(&self, node_id: &str, job_id: &str, grant: Option<&str>) -> Result<()> {
         let body = serde_json::json!({ "node_id": node_id, "job_id": job_id, "grant": grant });
