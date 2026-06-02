@@ -159,6 +159,29 @@ impl CeClient {
         json(self.http.post(self.url("/mesh-exec")).json(&body).send().await?).await
     }
 
+    /// Push a single file to a remote trusted device **over the CE mesh**
+    /// (`PUT /mesh-sync/:node_id/*path`). The local node signs the write and routes it through
+    /// libp2p (relay-assisted, so it traverses the target's NAT). `remote_path` is interpreted
+    /// relative to the target's home directory. `hint` is an optional relay circuit multiaddr that
+    /// speeds up the first dial to an unknown peer; pass `None` once the peer is reachable.
+    ///
+    /// This is the file-transport primitive that folder-sync apps build on: CE moves the bytes,
+    /// the app decides what to send, when, and how local paths map onto remote ones.
+    pub async fn mesh_sync_file(
+        &self,
+        node_id: &str,
+        remote_path: &str,
+        bytes: Vec<u8>,
+        hint: Option<&str>,
+    ) -> Result<()> {
+        let mut url = self.url(&format!("/mesh-sync/{node_id}/{}", encode_path(remote_path)));
+        if let Some(h) = hint.filter(|h| !h.is_empty()) {
+            url.push_str("?hint=");
+            url.push_str(&encode_component(h));
+        }
+        ok(self.http.put(url).body(bytes).send().await?).await
+    }
+
     /// Deploy a **WASM** workload on a specific host over the mesh — the module is referenced by
     /// its content hash (upload it first with [`put_blob`](Self::put_blob)). `inputs` are
     /// content-addressed CIDs the host stages from the data layer before launch (Stage 4); pass
@@ -455,6 +478,24 @@ async fn json<T: for<'de> Deserialize<'de>>(resp: reqwest::Response) -> Result<T
         return Err(anyhow!("CE API {status}: {body}"));
     }
     serde_json::from_str(&body).map_err(|e| anyhow!("decode {status} body: {e}: {body}"))
+}
+
+/// Percent-encode a relative path for a URL while preserving `/` separators (each segment is
+/// encoded independently). Keeps `mesh_sync_file` correct for paths with spaces or unicode.
+fn encode_path(path: &str) -> String {
+    path.split('/').map(encode_component).collect::<Vec<_>>().join("/")
+}
+
+/// Percent-encode one URL component, keeping only the RFC 3986 unreserved set verbatim.
+fn encode_component(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 /// Expect a successful empty response.
