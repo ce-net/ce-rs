@@ -282,6 +282,28 @@ impl CeClient {
         Ok(resp.bytes().await?.to_vec())
     }
 
+    // ----- app messaging (docs/app-messaging.md) -----
+
+    /// Send a directed application message to a node over the mesh (`POST /mesh/send`). `topic` is
+    /// an app-chosen namespace; `payload` is opaque bytes. The recipient authenticates the sender
+    /// (it sees your verified NodeId) and enqueues it for its app. Returns once the node confirms
+    /// delivery. Subscribe to incoming messages on `GET /mesh/messages/stream`, or poll
+    /// [`messages`](Self::messages).
+    pub async fn send_message(&self, to: &str, topic: &str, payload: &[u8]) -> Result<()> {
+        let body = serde_json::json!({
+            "to": to,
+            "topic": topic,
+            "payload_hex": hex::encode(payload),
+        });
+        ok(self.http.post(self.url("/mesh/send")).json(&body).send().await?).await
+    }
+
+    /// Snapshot of recently-received app messages (`GET /mesh/messages`). For reliable delivery
+    /// subscribe to the SSE stream instead; this ring is best-effort and capped.
+    pub async fn messages(&self) -> Result<Vec<AppMessage>> {
+        json(self.http.get(self.url("/mesh/messages")).send().await?).await
+    }
+
     /// Stop a job on a specific remote host (`POST /mesh-kill`).
     pub async fn mesh_kill(&self, node_id: &str, job_id: &str, grant: Option<&str>) -> Result<()> {
         let body = serde_json::json!({ "node_id": node_id, "job_id": job_id, "grant": grant });
@@ -441,6 +463,28 @@ pub struct Receipt {
     pub cumulative: Amount,
     /// Payer's signature (128 hex), redeemed by the host via `channel_close`.
     pub payer_sig: String,
+}
+
+/// A directed application message received from a mesh peer. `from` is the cryptographically
+/// authenticated sender NodeId — trust it to decide what to honor. Use [`payload`](Self::payload)
+/// to decode the opaque bytes.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AppMessage {
+    /// Authenticated sender NodeId (hex).
+    pub from: String,
+    /// App-chosen topic namespace.
+    pub topic: String,
+    /// Opaque payload, hex-encoded.
+    pub payload_hex: String,
+    /// Unix seconds when the local node received it.
+    pub received_at: u64,
+}
+
+impl AppMessage {
+    /// Decode the payload bytes.
+    pub fn payload(&self) -> Result<Vec<u8>> {
+        hex::decode(&self.payload_hex).map_err(|e| anyhow!("bad payload hex: {e}"))
+    }
 }
 
 /// Verifiable public randomness from the PoW chain tip.
