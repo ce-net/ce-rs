@@ -38,6 +38,36 @@ use serde::{Deserialize, Serialize};
 /// Default local CE node HTTP API base URL.
 pub const DEFAULT_BASE_URL: &str = "http://127.0.0.1:8844";
 
+/// Build a reqwest client that sends `Authorization: Bearer <token>` on every request.
+fn build_http(token: Option<&str>) -> reqwest::Client {
+    let mut headers = reqwest::header::HeaderMap::new();
+    if let Some(t) = token.map(str::trim).filter(|t| !t.is_empty()) {
+        if let Ok(v) = reqwest::header::HeaderValue::from_str(&format!("Bearer {t}")) {
+            headers.insert(reqwest::header::AUTHORIZATION, v);
+        }
+    }
+    reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+/// Discover the node's API token: `$CE_API_TOKEN` first (covers custom `--data-dir` and tests),
+/// else `<default data dir>/api.token` written by a locally-running node.
+pub fn discover_api_token() -> Option<String> {
+    if let Ok(t) = std::env::var("CE_API_TOKEN") {
+        let t = t.trim().to_string();
+        if !t.is_empty() {
+            return Some(t);
+        }
+    }
+    let dir = directories::ProjectDirs::from("", "", "ce")?.data_dir().to_path_buf();
+    std::fs::read_to_string(dir.join("api.token"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// Async client for a CE node's HTTP API.
 #[derive(Debug, Clone)]
 pub struct CeClient {
@@ -47,9 +77,18 @@ pub struct CeClient {
 
 impl CeClient {
     /// Client for a node at `base_url` (e.g. `http://127.0.0.1:8844`).
+    ///
+    /// The node's HTTP API token is attached to every request (so mutating calls pass the node's
+    /// auth middleware). It is discovered from `$CE_API_TOKEN`, else `<default data dir>/api.token`.
+    /// For a node started with a custom `--data-dir`, set `$CE_API_TOKEN` (or use [`with_token`]).
     pub fn new(base_url: impl Into<String>) -> Self {
+        Self::with_token(base_url, discover_api_token())
+    }
+
+    /// Client for `base_url` with an explicit API token (or `None` for read-only access).
+    pub fn with_token(base_url: impl Into<String>, token: Option<String>) -> Self {
         let base = base_url.into().trim_end_matches('/').to_string();
-        CeClient { base, http: reqwest::Client::new() }
+        CeClient { base, http: build_http(token.as_deref()) }
     }
 
     /// Client for the local node on the default port (8844).
@@ -62,6 +101,18 @@ impl CeClient {
     }
 
     // ----- read -----
+
+    /// The on-chain revoked `(issuer_hex, nonce)` capability set (`GET /capabilities/revoked`).
+    /// Apps consult this to deny revoked capability chains.
+    pub async fn revoked(&self) -> Result<Vec<(String, u64)>> {
+        #[derive(serde::Deserialize)]
+        struct R {
+            issuer: String,
+            nonce: u64,
+        }
+        let v: Vec<R> = json(self.http.get(self.url("/capabilities/revoked")).send().await?).await?;
+        Ok(v.into_iter().map(|r| (r.issuer, r.nonce)).collect())
+    }
 
     /// Liveness check (`GET /health`).
     pub async fn health(&self) -> Result<bool> {
