@@ -172,14 +172,33 @@ impl CeClient {
         node_id: &str,
         remote_path: &str,
         bytes: Vec<u8>,
+        caps: Option<&str>,
         hint: Option<&str>,
     ) -> Result<()> {
-        let mut url = self.url(&format!("/mesh-sync/{node_id}/{}", encode_path(remote_path)));
-        if let Some(h) = hint.filter(|h| !h.is_empty()) {
-            url.push_str("?hint=");
-            url.push_str(&encode_component(h));
-        }
+        let url = self.url(&format!(
+            "/mesh-sync/{node_id}/{}{}",
+            encode_path(remote_path),
+            mesh_sync_query(caps, hint)
+        ));
         ok(self.http.put(url).body(bytes).send().await?).await
+    }
+
+    /// Delete a single file on a remote trusted device **over the CE mesh** (true-mirror delete
+    /// propagation; `DELETE /mesh-sync/:node_id/*path`). `caps` is the capability chain token
+    /// authorizing the delete (needs the `delete` ability). See [`mesh_sync_file`](Self::mesh_sync_file).
+    pub async fn mesh_delete_file(
+        &self,
+        node_id: &str,
+        remote_path: &str,
+        caps: Option<&str>,
+        hint: Option<&str>,
+    ) -> Result<()> {
+        let url = self.url(&format!(
+            "/mesh-sync/{node_id}/{}{}",
+            encode_path(remote_path),
+            mesh_sync_query(caps, hint)
+        ));
+        ok(self.http.delete(url).send().await?).await
     }
 
     /// Deploy a **WASM** workload on a specific host over the mesh — the module is referenced by
@@ -478,6 +497,18 @@ async fn json<T: for<'de> Deserialize<'de>>(resp: reqwest::Response) -> Result<T
         return Err(anyhow!("CE API {status}: {body}"));
     }
     serde_json::from_str(&body).map_err(|e| anyhow!("decode {status} body: {e}: {body}"))
+}
+
+/// Build the `?caps=..&hint=..` query for mesh-sync/delete (omitting empty parts).
+fn mesh_sync_query(caps: Option<&str>, hint: Option<&str>) -> String {
+    let mut parts = Vec::new();
+    if let Some(c) = caps.filter(|c| !c.is_empty()) {
+        parts.push(format!("caps={}", encode_component(c)));
+    }
+    if let Some(h) = hint.filter(|h| !h.is_empty()) {
+        parts.push(format!("hint={}", encode_component(h)));
+    }
+    if parts.is_empty() { String::new() } else { format!("?{}", parts.join("&")) }
 }
 
 /// Percent-encode a relative path for a URL while preserving `/` separators (each segment is
