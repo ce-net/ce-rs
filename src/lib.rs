@@ -148,58 +148,9 @@ impl CeClient {
         Ok(v["job_id"].as_str().unwrap_or_default().to_string())
     }
 
-    /// Run a one-shot command in a sandboxed container on a **specific** host over the mesh
-    /// and return its output synchronously (`POST /mesh-exec`). This is the scatter/gather
-    /// primitive: fan a command out across hosts and collect each result.
-    ///
-    /// (v0 targets admin-trusted hosts; grant forwarding through the proxy is a pending
-    /// node-side enhancement, so this takes no grant yet.)
-    pub async fn mesh_exec(&self, node_id: &str, image: &str, cmd: &[String]) -> Result<ExecResult> {
-        let body = serde_json::json!({ "node_id": node_id, "image": image, "cmd": cmd });
-        json(self.http.post(self.url("/mesh-exec")).json(&body).send().await?).await
-    }
-
-    /// Push a single file to a remote trusted device **over the CE mesh**
-    /// (`PUT /mesh-sync/:node_id/*path`). The local node signs the write and routes it through
-    /// libp2p (relay-assisted, so it traverses the target's NAT). `remote_path` is interpreted
-    /// relative to the target's home directory. `hint` is an optional relay circuit multiaddr that
-    /// speeds up the first dial to an unknown peer; pass `None` once the peer is reachable.
-    ///
-    /// This is the file-transport primitive that folder-sync apps build on: CE moves the bytes,
-    /// the app decides what to send, when, and how local paths map onto remote ones.
-    pub async fn mesh_sync_file(
-        &self,
-        node_id: &str,
-        remote_path: &str,
-        bytes: Vec<u8>,
-        caps: Option<&str>,
-        hint: Option<&str>,
-    ) -> Result<()> {
-        let url = self.url(&format!(
-            "/mesh-sync/{node_id}/{}{}",
-            encode_path(remote_path),
-            mesh_sync_query(caps, hint)
-        ));
-        ok(self.http.put(url).body(bytes).send().await?).await
-    }
-
-    /// Delete a single file on a remote trusted device **over the CE mesh** (true-mirror delete
-    /// propagation; `DELETE /mesh-sync/:node_id/*path`). `caps` is the capability chain token
-    /// authorizing the delete (needs the `delete` ability). See [`mesh_sync_file`](Self::mesh_sync_file).
-    pub async fn mesh_delete_file(
-        &self,
-        node_id: &str,
-        remote_path: &str,
-        caps: Option<&str>,
-        hint: Option<&str>,
-    ) -> Result<()> {
-        let url = self.url(&format!(
-            "/mesh-sync/{node_id}/{}{}",
-            encode_path(remote_path),
-            mesh_sync_query(caps, hint)
-        ));
-        ok(self.http.delete(url).send().await?).await
-    }
+    // Remote exec and file sync/delete used to be SDK methods here (POST /mesh-exec,
+    // PUT/DELETE /mesh-sync). They moved out of CE into the `rdev` app (built on AppRequest +
+    // ce-cap); the SDK no longer wraps them. Apps drive them via `request`/`reply`.
 
     /// Deploy a **WASM** workload on a specific host over the mesh — the module is referenced by
     /// its content hash (upload it first with [`put_blob`](Self::put_blob)). `inputs` are
@@ -497,36 +448,6 @@ async fn json<T: for<'de> Deserialize<'de>>(resp: reqwest::Response) -> Result<T
         return Err(anyhow!("CE API {status}: {body}"));
     }
     serde_json::from_str(&body).map_err(|e| anyhow!("decode {status} body: {e}: {body}"))
-}
-
-/// Build the `?caps=..&hint=..` query for mesh-sync/delete (omitting empty parts).
-fn mesh_sync_query(caps: Option<&str>, hint: Option<&str>) -> String {
-    let mut parts = Vec::new();
-    if let Some(c) = caps.filter(|c| !c.is_empty()) {
-        parts.push(format!("caps={}", encode_component(c)));
-    }
-    if let Some(h) = hint.filter(|h| !h.is_empty()) {
-        parts.push(format!("hint={}", encode_component(h)));
-    }
-    if parts.is_empty() { String::new() } else { format!("?{}", parts.join("&")) }
-}
-
-/// Percent-encode a relative path for a URL while preserving `/` separators (each segment is
-/// encoded independently). Keeps `mesh_sync_file` correct for paths with spaces or unicode.
-fn encode_path(path: &str) -> String {
-    path.split('/').map(encode_component).collect::<Vec<_>>().join("/")
-}
-
-/// Percent-encode one URL component, keeping only the RFC 3986 unreserved set verbatim.
-fn encode_component(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for &b in s.as_bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
 }
 
 /// Expect a successful empty response.
