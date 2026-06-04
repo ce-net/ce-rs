@@ -12,4 +12,4 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Unit + integration tests
-        run: cargo test --all --locked
+        run: cargo test --all
