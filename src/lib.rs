@@ -32,7 +32,17 @@ pub use amount::{Amount, CREDIT};
 pub mod data;
 pub use data::{cid, Manifest};
 
+pub mod sse;
+pub use sse::{BlockEvent, Signal, SseDecoder, SseEvent, TxEvent};
+
+pub mod wallet;
+pub use wallet::{Balance, Direction, TxQuery, TxRecord, Wallet};
+
+pub mod tags;
+pub use tags::TagAdvertiser;
+
 use anyhow::{anyhow, Result};
+use futures_core::Stream;
 use serde::{Deserialize, Serialize};
 
 /// Default local CE node HTTP API base URL.
@@ -98,6 +108,55 @@ impl CeClient {
 
     fn url(&self, path: &str) -> String {
         format!("{}{path}", self.base)
+    }
+
+    /// Internal: GET a path and decode its JSON body. Used by SDK modules (wallet, ...) that
+    /// build their own paths (with query strings) but want the shared error handling.
+    pub(crate) async fn get_json<T: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<T> {
+        json(self.http.get(self.url(path)).send().await?).await
+    }
+
+    /// Internal: open an SSE endpoint, returning the raw streaming response. Callers feed the
+    /// body through [`sse::decode_stream`]. Errors if the endpoint is not a successful stream.
+    pub(crate) async fn open_sse(&self, path: &str) -> Result<reqwest::Response> {
+        let resp = self
+            .http
+            .get(self.url(path))
+            .header(reqwest::header::ACCEPT, "text/event-stream")
+            .header(reqwest::header::CACHE_CONTROL, "no-cache")
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(anyhow!("CE API {}: SSE open failed for {path}", resp.status()));
+        }
+        Ok(resp)
+    }
+
+    // ----- SSE streams -----
+
+    /// Stream every accepted block as it is mined or received (`GET /blocks/stream`). The returned
+    /// [`Stream`] yields `Result<BlockEvent>`; it ends when the connection closes. Reconnect is
+    /// the caller's responsibility (re-call this method).
+    pub async fn blocks_stream(&self) -> Result<impl Stream<Item = Result<BlockEvent>>> {
+        Ok(sse::decode_stream::<BlockEvent>(self.open_sse("/blocks/stream").await?))
+    }
+
+    /// Stream every verified transaction (`GET /transactions/stream`). Each frame is
+    /// `{ id, origin, kind, amount }`; for a wallet-relative view use
+    /// [`Wallet::transactions_stream`](crate::Wallet::transactions_stream).
+    pub async fn transactions_stream_events(&self) -> Result<impl Stream<Item = Result<TxEvent>>> {
+        Ok(sse::decode_stream::<TxEvent>(self.open_sse("/transactions/stream").await?))
+    }
+
+    /// Stream validated CEP-1 signals (`GET /signals/stream`).
+    pub async fn signals_stream(&self) -> Result<impl Stream<Item = Result<Signal>>> {
+        Ok(sse::decode_stream::<Signal>(self.open_sse("/signals/stream").await?))
+    }
+
+    /// Stream inbound app messages (`GET /mesh/messages/stream`) — the push counterpart to
+    /// polling [`messages`](Self::messages).
+    pub async fn messages_stream(&self) -> Result<impl Stream<Item = Result<AppMessage>>> {
+        Ok(sse::decode_stream::<AppMessage>(self.open_sse("/mesh/messages/stream").await?))
     }
 
     // ----- read -----
@@ -519,6 +578,19 @@ pub struct NodeStatus {
     pub height: u64,
     pub difficulty: u8,
     pub balance: Amount,
+    // ----- balance breakdown (additive; older nodes omit these) -----
+    /// Spendable balance: `balance` minus all locks (node-clamped at zero).
+    #[serde(default)]
+    pub free: Option<Amount>,
+    /// Credits locked in this node's open payment channels.
+    #[serde(default)]
+    pub locked_channels: Option<Amount>,
+    /// Credits locked in this node's active host bond.
+    #[serde(default)]
+    pub locked_bond: Option<Amount>,
+    /// This node's active host bond.
+    #[serde(default)]
+    pub bond: Option<Amount>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
