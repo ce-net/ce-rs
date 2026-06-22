@@ -106,6 +106,13 @@ impl CeClient {
         Self::new(DEFAULT_BASE_URL)
     }
 
+    /// The node API base URL this client targets (no trailing slash), e.g.
+    /// `http://127.0.0.1:8844`. Useful for logging, or for hitting an endpoint the SDK does not
+    /// yet wrap.
+    pub fn base_url(&self) -> &str {
+        &self.base
+    }
+
     fn url(&self, path: &str) -> String {
         format!("{}{path}", self.base)
     }
@@ -749,5 +756,116 @@ impl NodeHistory {
     /// (settled jobs + heartbeats received). Higher = more proven. Apps may define their own.
     pub fn delivered_work(&self) -> u64 {
         self.jobs_hosted + self.heartbeats_hosted
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base_url_is_trimmed_and_accessible() {
+        let c = CeClient::with_token("http://example.com:8844/", None);
+        assert_eq!(c.base_url(), "http://example.com:8844");
+        // url() composes correctly with no double slash.
+        assert_eq!(c.url("/status"), "http://example.com:8844/status");
+    }
+
+    #[test]
+    fn local_uses_default_base() {
+        assert_eq!(CeClient::local().base_url(), DEFAULT_BASE_URL);
+    }
+
+    #[test]
+    fn discover_api_token_reads_env_first() {
+        // Set the env var and confirm discovery returns it (covers the custom --data-dir path).
+        // SAFETY: single-threaded test; we set then immediately read and clear.
+        unsafe {
+            std::env::set_var("CE_API_TOKEN", "  env-token  ");
+        }
+        assert_eq!(discover_api_token().as_deref(), Some("env-token"));
+        unsafe {
+            std::env::set_var("CE_API_TOKEN", "");
+        }
+        // Empty env var should not be returned (falls through to file, which likely is absent).
+        let after = discover_api_token();
+        assert_ne!(after.as_deref(), Some(""));
+        unsafe {
+            std::env::remove_var("CE_API_TOKEN");
+        }
+    }
+
+    #[test]
+    fn build_http_with_invalid_token_does_not_panic() {
+        // A header value with control chars can't be a HeaderValue; build_http must still produce a
+        // working client (it silently drops the bad header).
+        let c = CeClient::with_token("http://127.0.0.1:8844", Some("bad\nvalue".into()));
+        assert_eq!(c.base_url(), "http://127.0.0.1:8844");
+    }
+
+    #[test]
+    fn node_status_optional_breakdown_defaults_to_none() {
+        let s: NodeStatus = serde_json::from_str(
+            r#"{"node_id":"n","height":1,"difficulty":1,"balance":"0"}"#,
+        )
+        .unwrap();
+        assert!(s.free.is_none());
+        assert!(s.locked_channels.is_none());
+        assert!(s.locked_bond.is_none());
+        assert!(s.bond.is_none());
+    }
+
+    #[test]
+    fn atlas_entry_has_tag() {
+        let e: AtlasEntry = serde_json::from_str(
+            r#"{"node_id":"n","cpu_cores":4,"mem_mb":8000,"running_jobs":1,"last_seen_secs":3,"tags":["gpu"]}"#,
+        )
+        .unwrap();
+        assert!(e.has_tag("gpu"));
+        assert!(!e.has_tag("cpu"));
+    }
+
+    #[test]
+    fn job_is_running_and_optional_fields() {
+        let running: Job = serde_json::from_str(r#"{"job_id":"j","status":"running"}"#).unwrap();
+        assert!(running.is_running());
+        assert!(running.payer.is_none());
+        let done: Job =
+            serde_json::from_str(r#"{"job_id":"j","status":"settled","cost":"5"}"#).unwrap();
+        assert!(!done.is_running());
+        assert_eq!(done.cost.unwrap().base(), 5);
+    }
+
+    #[test]
+    fn exec_result_ok() {
+        let ok = ExecResult { stdout: "".into(), stderr: "".into(), exit_code: 0 };
+        assert!(ok.ok());
+        let bad = ExecResult { stdout: "".into(), stderr: "boom".into(), exit_code: 1 };
+        assert!(!bad.ok());
+    }
+
+    #[test]
+    fn app_message_payload_decodes_hex() {
+        let m: AppMessage = serde_json::from_str(
+            r#"{"from":"f","topic":"t","payload_hex":"68656c6c6f","received_at":1}"#,
+        )
+        .unwrap();
+        assert_eq!(m.payload().unwrap(), b"hello");
+        assert!(m.reply_token.is_none());
+    }
+
+    #[test]
+    fn bidspec_serializes_amount_as_string() {
+        let spec = BidSpec {
+            image: "img".into(),
+            cmd: vec![],
+            cpu_cores: 1,
+            mem_mb: 64,
+            duration_secs: 10,
+            bid: Amount::from_credits(3),
+        };
+        let v = serde_json::to_value(&spec).unwrap();
+        assert_eq!(v["bid"], serde_json::json!("3000000000000000000"));
+        assert_eq!(v["cmd"], serde_json::json!([]));
     }
 }
