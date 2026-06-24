@@ -19,6 +19,13 @@ hex = "0.4"
 futures-core = "0.3"
 futures-util = "0.3"
 bytes = "1"
+tokio = { version = "1", features = ["time", "macros"], optional = true }
+tracing = { version = "0.1", optional = true }
+
+[features]
+# `serve` adds the reusable mesh-app serving loop (ce_rs::serve). It pulls a tokio timer +
+# tracing; the base SDK stays runtime-agnostic and dependency-light without it.
+serve = ["dep:tokio", "dep:tracing"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "net", "io-util", "process"] }

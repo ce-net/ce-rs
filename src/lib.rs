@@ -35,6 +35,9 @@ pub use data::{cid, Manifest};
 pub mod sse;
 pub use sse::{BlockEvent, Signal, SseDecoder, SseEvent, TxEvent};
 
+#[cfg(feature = "serve")]
+pub mod serve;
+
 pub mod wallet;
 pub use wallet::{Balance, Direction, TxQuery, TxRecord, Wallet};
 
