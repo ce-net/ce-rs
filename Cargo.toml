@@ -26,6 +26,10 @@ tracing = { version = "0.1", optional = true }
 # `serve` adds the reusable mesh-app serving loop (ce_rs::serve). It pulls a tokio timer +
 # tracing; the base SDK stays runtime-agnostic and dependency-light without it.
 serve = ["dep:tokio", "dep:tracing"]
+# `locate` adds mesh-native service discovery + instance selection (ce_rs::locate): the keystone
+# every higher SDK uses to pick which live instance of a service to talk to. Pulls a tokio
+# timer (re-advertise heartbeat) + tracing.
+locate = ["dep:tokio", "dep:tracing"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "net", "io-util", "process"] }

@@ -38,6 +38,9 @@ pub use sse::{BlockEvent, Signal, SseDecoder, SseEvent, TxEvent};
 #[cfg(feature = "serve")]
 pub mod serve;
 
+#[cfg(feature = "locate")]
+pub mod locate;
+
 pub mod wallet;
 pub use wallet::{Balance, Direction, TxQuery, TxRecord, Wallet};
 
@@ -202,6 +205,13 @@ impl CeClient {
     /// auditable host selection from `beacon.hash`.
     pub async fn beacon(&self) -> Result<Beacon> {
         json(self.http.get(self.url("/beacon")).send().await?).await
+    }
+
+    /// Raw per-peer latency edges measured by the local node (`GET /netgraph`): smoothed RTT to each
+    /// connected libp2p peer. The transport-intrinsic latency primitive that graph/placement SDKs
+    /// build on. Peers are keyed by libp2p PeerId (hex), not NodeId.
+    pub async fn netgraph(&self) -> Result<Vec<NetEdge>> {
+        json(self.http.get(self.url("/netgraph")).send().await?).await
     }
 
     /// All jobs known to this node (`GET /jobs`).
@@ -603,6 +613,21 @@ pub struct NodeStatus {
     pub bond: Option<Amount>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct NetEdge {
+    /// The connected peer, keyed by libp2p PeerId (hex).
+    pub peer: String,
+    /// Smoothed round-trip time to the peer, in milliseconds (EWMA).
+    pub rtt_ms: f64,
+    /// Number of samples folded into the estimate.
+    #[serde(default)]
+    pub samples: u64,
+    /// Unix seconds of the most recent sample.
+    #[serde(default)]
+    pub last_seen_secs: u64,
+}
+
+/// A capacity-atlas entry: one peer's advertised resources and self-tags.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AtlasEntry {
     pub node_id: String,
