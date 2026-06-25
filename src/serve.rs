@@ -54,10 +54,14 @@ pub struct Request {
 /// A mesh request handler: given an authenticated [`Request`], produce the reply bytes. Decoding and
 /// authorization (e.g. `ce-cap`) are the handler's responsibility. A handler should always return a
 /// reply (even an encoded error), so the requester's [`CeClient::request`] never blocks to timeout.
-#[allow(async_fn_in_trait)]
+///
+/// The returned future is required to be `Send` so [`serve`] / [`serve_where`] can be driven from a
+/// spawned task on a multi-threaded runtime (`tokio::spawn`), not only on the current thread. An
+/// `async fn handle(&self, req: Request) -> Vec<u8>` impl satisfies this as long as its body is
+/// `Send` (it holds no `!Send` value across an `.await`).
 pub trait Handler: Send + Sync {
     /// Handle one request and return the reply payload.
-    async fn handle(&self, req: Request) -> Vec<u8>;
+    fn handle(&self, req: Request) -> impl std::future::Future<Output = Vec<u8>> + Send;
 }
 
 /// Serve an explicit set of `topics` until `shutdown` resolves: subscribe to each, then answer every
