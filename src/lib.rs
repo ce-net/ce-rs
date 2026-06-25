@@ -54,6 +54,10 @@ use serde::{Deserialize, Serialize};
 /// Default local CE node HTTP API base URL.
 pub const DEFAULT_BASE_URL: &str = "http://127.0.0.1:8844";
 
+/// How many object chunks to upload/download concurrently in [`CeClient::put_object`] /
+/// [`CeClient::get_object`]. Bounded so a large object can't open thousands of sockets at once.
+pub const OBJECT_CHUNK_CONCURRENCY: usize = 8;
+
 /// Build a reqwest client that sends `Authorization: Bearer <token>` on every request.
 fn build_http(token: Option<&str>) -> reqwest::Client {
     let mut headers = reqwest::header::HeaderMap::new();
@@ -338,39 +342,58 @@ impl CeClient {
     /// pass it to [`get_object`](Self::get_object) to fetch the whole object back. Chunking is
     /// client-side (see [`data`]); the node just stores opaque blobs.
     pub async fn put_object(&self, bytes: &[u8]) -> Result<String> {
+        use futures_util::{StreamExt, TryStreamExt, stream};
         let (manifest, chunks) = data::chunk_object(bytes, data::DEFAULT_CHUNK_SIZE);
-        for (chunk_cid, chunk) in chunks {
+        // Upload chunks concurrently (order-independent — the manifest records the order). Bounded so
+        // a huge object can't open thousands of sockets at once. This is the dominant write cost, so
+        // parallelism here is what makes object/file writes fast.
+        stream::iter(chunks.into_iter().map(|(chunk_cid, chunk)| async move {
             let stored = self.put_blob(chunk).await?;
             if stored != chunk_cid {
                 return Err(anyhow!(
                     "blob store returned hash {stored} for chunk {chunk_cid} (hashing mismatch)"
                 ));
             }
-        }
+            Ok::<(), anyhow::Error>(())
+        }))
+        .buffer_unordered(OBJECT_CHUNK_CONCURRENCY)
+        .try_collect::<()>()
+        .await?;
         let manifest_bytes = serde_json::to_vec(&manifest)?;
         self.put_blob(manifest_bytes).await
     }
 
     /// Fetch an object by its CID: resolve the manifest, pull each chunk from the blob store, and
     /// verify every chunk against its CID before reassembling (content addressing makes this
-    /// trustless). Chunks are fetched sequentially in Stage 1; parallel multi-provider fetch is
-    /// the Stage 2 mesh refinement.
+    /// trustless). Chunks are fetched concurrently (bounded) and reassembled in manifest order.
     pub async fn get_object(&self, object_cid: &str) -> Result<Vec<u8>> {
+        use futures_util::{StreamExt, TryStreamExt, stream};
         let manifest_bytes = self.get_blob(object_cid).await?;
         let manifest: data::Manifest = serde_json::from_slice(&manifest_bytes)
             .map_err(|e| anyhow!("{object_cid} is not a v1 object manifest: {e}"))?;
         if !manifest.is_v1() {
             return Err(anyhow!("unsupported manifest kind: {}", manifest.kind));
         }
-        let mut out = Vec::with_capacity(manifest.total_size as usize);
-        for chunk_cid in &manifest.chunks {
-            let chunk = self.get_blob(chunk_cid).await?;
+        // `buffered` keeps results in manifest order while fetching up to N chunks at once. Own the
+        // cids (don't borrow `manifest` inside the futures) so the returned future borrows only
+        // `&self` — borrowing `manifest` here entangles an extra lifetime into this async fn's opaque
+        // return type and breaks HRTB inference for callers that box it (e.g. ce-coord's loader).
+        let cids: Vec<String> = manifest.chunks.clone();
+        let chunks: Vec<Vec<u8>> = stream::iter(cids.into_iter().map(|chunk_cid| async move {
+            let chunk = self.get_blob(&chunk_cid).await?;
             let got = data::cid(&chunk);
-            if got != *chunk_cid {
+            if got != chunk_cid {
                 return Err(anyhow!(
                     "chunk verification failed: expected {chunk_cid}, got {got}"
                 ));
             }
+            Ok::<Vec<u8>, anyhow::Error>(chunk)
+        }))
+        .buffered(OBJECT_CHUNK_CONCURRENCY)
+        .try_collect()
+        .await?;
+        let mut out = Vec::with_capacity(manifest.total_size as usize);
+        for chunk in chunks {
             out.extend_from_slice(&chunk);
         }
         if out.len() as u64 != manifest.total_size {
