@@ -94,6 +94,11 @@ pub async fn locate(ce: &CeClient, service: &str, opts: &LocateOpts) -> Result<V
     let beacon_hash = ce.beacon().await.ok().map(|b| b.hash).unwrap_or_default();
     let now = unix_now();
 
+    // The local node is a valid candidate for any service it advertises — always live, zero network
+    // latency — but it never appears in its OWN atlas (the atlas is remote-peer capacity). Look it
+    // up explicitly so a co-located service (serve + locate on one node) is reachable.
+    let local_id = ce.status().await.ok().map(|s| s.node_id);
+
     // Index the atlas by node id for O(1) lookup.
     let mut by_id = std::collections::HashMap::new();
     for e in &atlas {
@@ -102,6 +107,23 @@ pub async fn locate(ce: &CeClient, service: &str, opts: &LocateOpts) -> Result<V
 
     let mut scored: Vec<Instance> = Vec::new();
     for id in ids {
+        // Co-located self: always live and zero-latency, so prefer it for a service we host. (We
+        // can't introspect self's capability tags here, so skip self when tags are required.)
+        if Some(&id) == local_id.as_ref() {
+            if !opts.require_tags.is_empty() {
+                continue;
+            }
+            scored.push(Instance {
+                node_id: id.clone(),
+                score: 1.0,
+                cores: 0,
+                mem_mb: 0,
+                tags: Vec::new(),
+                last_seen_secs: now,
+                fault_domain: String::new(),
+            });
+            continue;
+        }
         let Some(entry) = by_id.get(&id) else { continue }; // not in atlas -> unknown/dead
         // Liveness: drop stale advertisements.
         let age = now.saturating_sub(entry.last_seen_secs);
