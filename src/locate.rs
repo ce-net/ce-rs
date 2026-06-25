@@ -120,7 +120,7 @@ pub async fn locate(ce: &CeClient, service: &str, opts: &LocateOpts) -> Result<V
                 mem_mb: 0,
                 tags: Vec::new(),
                 last_seen_secs: now,
-                fault_domain: String::new(),
+                fault_domain: None,
             });
             continue;
         }
