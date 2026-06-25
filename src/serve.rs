@@ -60,8 +60,8 @@ pub trait Handler: Send + Sync {
     async fn handle(&self, req: Request) -> Vec<u8>;
 }
 
-/// Serve `topics` until `shutdown` resolves: subscribe to each, then answer every incoming request
-/// from the node's inbound message stream via `handler`, replying over the mesh.
+/// Serve an explicit set of `topics` until `shutdown` resolves: subscribe to each, then answer every
+/// incoming request from the node's inbound message stream via `handler`, replying over the mesh.
 ///
 /// Reconnects to the message stream with exponential backoff (capped at 10s), and de-duplicates by
 /// reply token so a request redelivered after a reconnect is answered at most once. Non-request
@@ -72,10 +72,31 @@ pub async fn serve<H: Handler>(
     handler: &H,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<()> {
+    let set: HashSet<String> = topics.iter().map(|t| t.to_string()).collect();
+    serve_where(ce, topics, move |t| set.contains(t), handler, shutdown).await
+}
+
+/// The general serve loop: answer every inbound request whose topic satisfies `accept`. Use this
+/// when topics are a family rather than a fixed set — e.g. a service that handles `app/rpc/*` or any
+/// `app/` prefix with dynamic sub-topics. `subscribe` lists the pub/sub topics to subscribe to
+/// (often empty for purely directed request/reply services, where requests arrive regardless).
+///
+/// Reconnects with capped exponential backoff and de-duplicates by reply token. Authorization stays
+/// the handler's job.
+pub async fn serve_where<H, F>(
+    ce: &CeClient,
+    subscribe: &[&str],
+    accept: F,
+    handler: &H,
+    shutdown: impl std::future::Future<Output = ()>,
+) -> Result<()>
+where
+    H: Handler,
+    F: Fn(&str) -> bool,
+{
     use futures_util::StreamExt as _;
 
-    let topic_set: HashSet<String> = topics.iter().map(|t| t.to_string()).collect();
-    for t in topics {
+    for t in subscribe {
         ce.subscribe(t).await?;
     }
 
@@ -103,7 +124,7 @@ pub async fn serve<H: Handler>(
             tokio::select! {
                 _ = &mut shutdown => return Ok(()),
                 item = stream.next() => match item {
-                    Some(Ok(m)) => answer_one(ce, handler, &topic_set, &mut seen, m).await,
+                    Some(Ok(m)) => answer_one(ce, handler, &accept, &mut seen, m).await,
                     Some(Err(e)) => {
                         tracing::warn!(error = %e, "serve: stream error; reconnecting");
                         break;
@@ -115,16 +136,19 @@ pub async fn serve<H: Handler>(
     }
 }
 
-/// Decode one inbound message and, if it is a request on a served topic we have not answered yet,
+/// Decode one inbound message and, if it is a request on an accepted topic we have not answered yet,
 /// run the handler and reply over the mesh.
-async fn answer_one<H: Handler>(
+async fn answer_one<H, F>(
     ce: &CeClient,
     handler: &H,
-    topics: &HashSet<String>,
+    accept: &F,
     seen: &mut HashSet<u64>,
     m: AppMessage,
-) {
-    if !topics.contains(&m.topic) {
+) where
+    H: Handler,
+    F: Fn(&str) -> bool,
+{
+    if !accept(&m.topic) {
         return;
     }
     let Some(token) = m.reply_token else {
