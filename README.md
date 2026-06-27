@@ -37,24 +37,34 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-## What it covers (v0)
+## What it covers
 
-The unauthenticated local-node API:
+A typed async client over the full node HTTP + SSE API:
 
-- `status`, `health`, `atlas`
-- `transfer`
-- `bid` (broadcast placement), `jobs`, `job`, `kill`
-- `mesh_deploy` / `mesh_kill` (directed placement on a specific host over the mesh)
+- Status / reads: `status`, `health`, `atlas`, `beacon`, `netgraph`, `history`, `bootstrap`
+- Money: `transfer`, `wallet` module (`Wallet`, `Balance`, `TxRecord`, `TxQuery`, `Direction`)
+- Jobs: `bid` (broadcast placement), `jobs`, `job`, `kill`, `mesh_deploy` / `mesh_kill`
+  (directed placement on a specific host over the mesh), `mesh_deploy_wasm`
+- App messaging: `send_message`, `messages`, `subscribe`, `publish`, `request`, `reply`
+- Payment channels: `channel_open`, `sign_receipt`, `channel_close`, `channel_expire`, `channels`
+- Naming / discovery: `claim_name`, `resolve_name`, `advertise_service`, `find_service`
+- Blobs / objects: `put_blob`, `get_blob`, `put_object`, `get_object`, `fetch_chunk_paid`
+- Capabilities: `revoked`; relay: `pay_relay`
+- SSE streams: `blocks_stream`, `transactions_stream_events`, `signals_stream`, `messages_stream`
+
+**Feature flags.** `serve` adds the mesh-app request/reply loop (`serve` / `serve_where` +
+`Handler` / `Request` in `src/serve.rs`). `locate` adds service discovery (`locate` / `call` /
+`register` + `Instance` / `LocateOpts` in `src/locate.rs`).
 
 **Money is integer base units.** `Amount` wraps `i128` base units (`1 credit = 10^18`), never
 floats, and (de)serializes as a decimal string (amounts exceed JSON's 2^53 limit). Use
 `Amount::from_credits(n)`, `Amount::parse_credits("1.5")`, and `.credits()` for display.
 
-## Planned
-
-CE-auth request signing (for direct-to-remote `/exec`,`/sync`), SSE subscriptions
-(`/blocks/stream`, `/signals/stream`, `/transactions/stream`), and grant issuing helpers.
+Note: remote `exec`/`sync` are deliberately NOT in this SDK — they moved to the `rdev` app
+(built on CE primitives). The SDK holds no key material and reaches peers only through the
+local node's mesh HTTP endpoints.
 
 ## License
 
-MIT © Leif Rydenfalk
+AGPL-3.0-only © Leif Rydenfalk. A commercial license is also available — see
+[`LICENSING.md`](./LICENSING.md) and [`COMMERCIAL-LICENSE.md`](./COMMERCIAL-LICENSE.md).
