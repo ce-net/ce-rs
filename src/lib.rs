@@ -282,6 +282,14 @@ impl CeClient {
         json(self.http.get(self.url("/atlas")).send().await?).await
     }
 
+    /// Live ce-lane flows with their shared-ring counters (`GET /lanes`) — the same-host
+    /// shared-memory transport's metering readout. This is what an economy adapter polls to
+    /// bill traffic it never sat in the path of (approve-then-splice). Empty on non-unix nodes
+    /// (the lane is unix-only). Read-only, no token.
+    pub async fn lanes(&self) -> Result<Vec<LaneInfo>> {
+        json(self.http.get(self.url("/lanes")).send().await?).await
+    }
+
     /// Verifiable public randomness from the PoW tip (`GET /beacon`). Seed reproducible,
     /// auditable host selection from `beacon.hash`.
     pub async fn beacon(&self) -> Result<Beacon> {
@@ -795,6 +803,37 @@ pub struct NodeStatus {
     /// predate the field — treat as `true` (economy on), the historical default.
     #[serde(default)]
     pub economy: Option<bool>,
+}
+
+/// One live ce-lane flow as reported by `GET /lanes` — the metering readout an economy adapter
+/// bills from. Mirrors the node's JSON; kept a standalone type here (not the unix-only
+/// `ce-lane` crate types) so the accessor works on every platform.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LaneInfo {
+    pub flow_id: u64,
+    pub target: String,
+    pub created_at: u64,
+    pub counters: FlowCounters,
+    /// Capability links `(issuer_hex, nonce)` this flow was bound to; revoking any severs it.
+    #[serde(default)]
+    pub links: Vec<(String, u64)>,
+}
+
+/// Combined per-direction counters of a flow (read live from the shared ring headers).
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+pub struct FlowCounters {
+    pub a_to_b: RingCounters,
+    pub b_to_a: RingCounters,
+}
+
+/// One direction's counters. `msgs`/`bytes` are cumulative and monotonic — the substrate for
+/// metering deltas; `queued` is in-flight; `closed` marks a torn-down direction.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+pub struct RingCounters {
+    pub msgs: u64,
+    pub bytes: u64,
+    pub queued: u64,
+    pub closed: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
