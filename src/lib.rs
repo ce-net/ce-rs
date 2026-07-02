@@ -790,6 +790,11 @@ pub struct NodeStatus {
     /// This node's active host bond.
     #[serde(default)]
     pub bond: Option<Amount>,
+    /// Whether the node runs the economy. `Some(false)` = personal-mesh mode (no chain,
+    /// jobs, or credits; the economic endpoints answer 503). `None` on older nodes that
+    /// predate the field — treat as `true` (economy on), the historical default.
+    #[serde(default)]
+    pub economy: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
