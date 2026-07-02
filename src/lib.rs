@@ -29,6 +29,9 @@
 mod amount;
 pub use amount::{Amount, CREDIT};
 
+#[cfg(unix)]
+mod lane;
+
 pub mod data;
 pub use data::{cid, Manifest};
 
@@ -88,11 +91,23 @@ pub fn discover_api_token() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// Async client for a CE node's HTTP API.
+/// Async client for a CE node. Speaks the HTTP API, and — targeting the LOCAL node on unix,
+/// when the node exposes `<data_dir>/lane.sock` — transparently rides the ce-lane shared-memory
+/// transport for the hot app-messaging paths (publish/send/request/reply/subscribe/stream),
+/// falling back to HTTP silently on any lane absence or failure. Same node-side `AppBus`
+/// either way, so apps observe identical behavior.
 #[derive(Debug, Clone)]
 pub struct CeClient {
     base: String,
     http: reqwest::Client,
+    #[cfg(unix)]
+    token: Option<String>,
+    /// Lazily-bound lane transport, shared across clones. `None` inside = tried and unavailable.
+    #[cfg(unix)]
+    lane_cell: std::sync::Arc<std::sync::OnceLock<Option<std::sync::Arc<lane::LaneClient>>>>,
+    /// Whether this client MAY use the lane (local target, not disabled via `$CE_NO_LANE`).
+    #[cfg(unix)]
+    lane_candidate: bool,
 }
 
 impl CeClient {
@@ -108,7 +123,50 @@ impl CeClient {
     /// Client for `base_url` with an explicit API token (or `None` for read-only access).
     pub fn with_token(base_url: impl Into<String>, token: Option<String>) -> Self {
         let base = base_url.into().trim_end_matches('/').to_string();
-        CeClient { base, http: build_http(token.as_deref()) }
+        let http = build_http(token.as_deref());
+        #[cfg(unix)]
+        {
+            // The lane is same-host only: consider it exactly when this client targets the
+            // local node (and the operator hasn't disabled it for debugging).
+            let local = base.starts_with("http://127.0.0.1") || base.starts_with("http://localhost");
+            let disabled = std::env::var("CE_NO_LANE").map(|v| !v.trim().is_empty()).unwrap_or(false);
+            CeClient {
+                base,
+                http,
+                token,
+                lane_cell: std::sync::Arc::new(std::sync::OnceLock::new()),
+                lane_candidate: local && !disabled,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            CeClient { base, http }
+        }
+    }
+
+    /// The lane transport when this client may and can use it; `None` = stay on HTTP. Bound
+    /// once, shared across clones; a lane that later dies filters out here so every subsequent
+    /// call falls back to HTTP without the app noticing.
+    #[cfg(unix)]
+    fn lane(&self) -> Option<std::sync::Arc<lane::LaneClient>> {
+        if !self.lane_candidate {
+            return None;
+        }
+        self.lane_cell
+            .get_or_init(|| {
+                let path = lane::socket_path()?;
+                let token = self.token.clone()?;
+                lane::LaneClient::bind(&path, &token).ok().map(std::sync::Arc::new)
+            })
+            .clone()
+            .filter(|l| !l.is_dead())
+    }
+
+    /// Parse a 64-hex NodeId for the lane's binary wire form.
+    #[cfg(unix)]
+    fn parse_node_id(hex_id: &str) -> Option<[u8; 32]> {
+        let b = hex::decode(hex_id.trim()).ok()?;
+        b.try_into().ok()
     }
 
     /// Client for the local node on the default port (8844).
@@ -173,7 +231,26 @@ impl CeClient {
     /// Stream inbound app messages (`GET /mesh/messages/stream`) — the push counterpart to
     /// polling [`messages`](Self::messages).
     pub async fn messages_stream(&self) -> Result<impl Stream<Item = Result<AppMessage>>> {
-        Ok(sse::decode_stream::<AppMessage>(self.open_sse("/mesh/messages/stream").await?))
+        use futures_util::StreamExt;
+        // Same-host fast path: the node PUSHES inbound messages over the lane (Watch/Event) —
+        // identical content to the SSE stream, no HTTP, no polling. Falls back silently.
+        #[cfg(unix)]
+        if let Some(l) = self.lane() {
+            if let Ok(rx) = l.watch_stream().await {
+                return Ok(rx
+                    .map(|m| {
+                        Ok(AppMessage {
+                            from: hex::encode(m.from),
+                            topic: m.topic,
+                            payload_hex: hex::encode(&m.payload),
+                            received_at: m.received_at,
+                            reply_token: m.reply_token,
+                        })
+                    })
+                    .boxed());
+            }
+        }
+        Ok(sse::decode_stream::<AppMessage>(self.open_sse("/mesh/messages/stream").await?).boxed())
     }
 
     // ----- read -----
@@ -439,6 +516,19 @@ impl CeClient {
     /// delivery. Subscribe to incoming messages on `GET /mesh/messages/stream`, or poll
     /// [`messages`](Self::messages).
     pub async fn send_message(&self, to: &str, topic: &str, payload: &[u8]) -> Result<()> {
+        #[cfg(unix)]
+        if let (Some(l), Some(to_id)) = (self.lane(), Self::parse_node_id(to)) {
+            use ce_lane::proto::{NodeOk, NodeOp};
+            match l
+                .op(NodeOp::Send { to: to_id, topic: topic.into(), payload: payload.to_vec() })
+                .await
+            {
+                Ok(Ok(NodeOk::Done)) => return Ok(()),
+                Ok(Ok(_)) => return Err(anyhow!("CE lane: unexpected response")),
+                Ok(Err(e)) => return Err(anyhow!("CE node: {e}")),
+                Err(_) => {} // lane gone mid-flight: fall back to HTTP below
+            }
+        }
         let body = serde_json::json!({
             "to": to,
             "topic": topic,
@@ -457,6 +547,16 @@ impl CeClient {
     /// Subscribe to an app pub/sub topic so this node receives its messages (`POST
     /// /mesh/subscribe`). Idempotent; lasts for the node's lifetime.
     pub async fn subscribe(&self, topic: &str) -> Result<()> {
+        #[cfg(unix)]
+        if let Some(l) = self.lane() {
+            use ce_lane::proto::{NodeOk, NodeOp};
+            match l.op(NodeOp::Subscribe { topic: topic.into() }).await {
+                Ok(Ok(NodeOk::Done)) => return Ok(()),
+                Ok(Ok(_)) => return Err(anyhow!("CE lane: unexpected response")),
+                Ok(Err(e)) => return Err(anyhow!("CE node: {e}")),
+                Err(_) => {}
+            }
+        }
         let body = serde_json::json!({ "topic": topic });
         ok(self.http.post(self.url("/mesh/subscribe")).json(&body).send().await?).await
     }
@@ -464,6 +564,16 @@ impl CeClient {
     /// Publish a signed message to an app pub/sub topic (`POST /mesh/publish`). The node signs it
     /// (subscribers verify authorship) and broadcasts it to everyone subscribed to `topic`.
     pub async fn publish(&self, topic: &str, payload: &[u8]) -> Result<()> {
+        #[cfg(unix)]
+        if let Some(l) = self.lane() {
+            use ce_lane::proto::{NodeOk, NodeOp};
+            match l.op(NodeOp::Publish { topic: topic.into(), payload: payload.to_vec() }).await {
+                Ok(Ok(NodeOk::Done)) => return Ok(()),
+                Ok(Ok(_)) => return Err(anyhow!("CE lane: unexpected response")),
+                Ok(Err(e)) => return Err(anyhow!("CE node: {e}")),
+                Err(_) => {}
+            }
+        }
         let body = serde_json::json!({ "topic": topic, "payload_hex": hex::encode(payload) });
         ok(self.http.post(self.url("/mesh/publish")).json(&body).send().await?).await
     }
@@ -477,6 +587,24 @@ impl CeClient {
         payload: &[u8],
         timeout_ms: u64,
     ) -> Result<Vec<u8>> {
+        #[cfg(unix)]
+        if let (Some(l), Some(to_id)) = (self.lane(), Self::parse_node_id(to)) {
+            use ce_lane::proto::{NodeOk, NodeOp};
+            match l
+                .op(NodeOp::Request {
+                    to: to_id,
+                    topic: topic.into(),
+                    payload: payload.to_vec(),
+                    timeout_ms,
+                })
+                .await
+            {
+                Ok(Ok(NodeOk::Reply { payload })) => return Ok(payload),
+                Ok(Ok(_)) => return Err(anyhow!("CE lane: unexpected response")),
+                Ok(Err(e)) => return Err(anyhow!("CE node: {e}")),
+                Err(_) => {}
+            }
+        }
         let body = serde_json::json!({
             "to": to,
             "topic": topic,
@@ -492,6 +620,16 @@ impl CeClient {
     /// Answer an incoming request, identified by the `reply_token` on its [`AppMessage`] (`POST
     /// /mesh/reply`). The reply is routed back to the original requester's [`request`](Self::request).
     pub async fn reply(&self, token: u64, payload: &[u8]) -> Result<()> {
+        #[cfg(unix)]
+        if let Some(l) = self.lane() {
+            use ce_lane::proto::{NodeOk, NodeOp};
+            match l.op(NodeOp::Reply { token, payload: payload.to_vec() }).await {
+                Ok(Ok(NodeOk::Done)) => return Ok(()),
+                Ok(Ok(_)) => return Err(anyhow!("CE lane: unexpected response")),
+                Ok(Err(e)) => return Err(anyhow!("CE node: {e}")),
+                Err(_) => {}
+            }
+        }
         let body = serde_json::json!({ "token": token, "payload_hex": hex::encode(payload) });
         ok(self.http.post(self.url("/mesh/reply")).json(&body).send().await?).await
     }

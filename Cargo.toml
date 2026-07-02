@@ -22,6 +22,15 @@ bytes = "1"
 tokio = { version = "1", features = ["time", "macros"], optional = true }
 tracing = { version = "0.1", optional = true }
 
+# The transparent same-host fast path (ce-lane's `node` router target): shared-memory rings
+# instead of local HTTP when <data_dir>/lane.sock exists, silent HTTP fallback otherwise.
+# ce-lane is deliberately dependency-light (no libp2p/bollard) so this does not violate the
+# "SDK stays thin" rule; its mux runs on std threads + futures-channel, so the base SDK stays
+# runtime-agnostic.
+[target.'cfg(unix)'.dependencies]
+ce-lane = { git = "https://github.com/ce-net/ce" }
+futures-channel = "0.3"
+
 [features]
 # `serve` adds the reusable mesh-app serving loop (ce_rs::serve). It pulls a tokio timer +
 # tracing; the base SDK stays runtime-agnostic and dependency-light without it.

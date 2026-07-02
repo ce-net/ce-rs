@@ -762,10 +762,13 @@ async fn advertise_tag_applies_prefix() {
     client_for(&server).advertise_tag("gpu").await.unwrap();
 }
 
+// The tag routes below are registered percent-encoded (`tag%3Agpu`): the client encodes path
+// segments (see encode_path_segment) exactly as a real node's router expects — axum decodes
+// them back — but this mock matches the raw request path, so it must hold the wire form.
 #[tokio::test]
 async fn find_tag_applies_prefix() {
     let server = MockServer::new()
-        .route("GET", "/discovery/find/tag:gpu", Reply::json(200, r#"{"providers":["n1","n2"]}"#))
+        .route("GET", "/discovery/find/tag%3Agpu", Reply::json(200, r#"{"providers":["n1","n2"]}"#))
         .start()
         .await;
     let got = client_for(&server).find_tag("gpu").await.unwrap();
@@ -775,8 +778,8 @@ async fn find_tag_applies_prefix() {
 #[tokio::test]
 async fn find_tags_all_intersects_live() {
     let server = MockServer::new()
-        .route("GET", "/discovery/find/tag:gpu", Reply::json(200, r#"{"providers":["n1","n2","n3"]}"#))
-        .route("GET", "/discovery/find/tag:infer", Reply::json(200, r#"{"providers":["n2","n3","n4"]}"#))
+        .route("GET", "/discovery/find/tag%3Agpu", Reply::json(200, r#"{"providers":["n1","n2","n3"]}"#))
+        .route("GET", "/discovery/find/tag%3Ainfer", Reply::json(200, r#"{"providers":["n2","n3","n4"]}"#))
         .start()
         .await;
     let got = client_for(&server).find_tags_all(&["gpu", "infer"]).await.unwrap();
@@ -792,8 +795,8 @@ async fn find_tags_all_empty_input_is_empty() {
 #[tokio::test]
 async fn find_tags_any_dedups_union_live() {
     let server = MockServer::new()
-        .route("GET", "/discovery/find/tag:a", Reply::json(200, r#"{"providers":["n1","n2"]}"#))
-        .route("GET", "/discovery/find/tag:b", Reply::json(200, r#"{"providers":["n2","n4"]}"#))
+        .route("GET", "/discovery/find/tag%3Aa", Reply::json(200, r#"{"providers":["n1","n2"]}"#))
+        .route("GET", "/discovery/find/tag%3Ab", Reply::json(200, r#"{"providers":["n2","n4"]}"#))
         .start()
         .await;
     let got = client_for(&server).find_tags_any(&["a", "b"]).await.unwrap();
