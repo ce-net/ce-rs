@@ -32,6 +32,9 @@ pub use amount::{Amount, CREDIT};
 #[cfg(unix)]
 mod lane;
 
+#[cfg(unix)]
+pub mod adapt;
+
 pub mod data;
 pub use data::{cid, Manifest};
 

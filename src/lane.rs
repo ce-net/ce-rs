@@ -59,6 +59,10 @@ impl LaneClient {
         let req = ce_lane::bind::BindRequest {
             token: token.to_string(),
             target: TARGET_NODE.to_string(),
+            // If the host launched this app under a name (`$CE_LANE_APP`, set at spawn for a
+            // sandboxed/foreign app), pass it so the node resolves its membrane adapter chain
+            // and interposes transparently. Absent = the anonymous operator app = direct.
+            app: std::env::var("CE_LANE_APP").ok().filter(|s| !s.trim().is_empty()),
             caps: None,
             slot_size: 64 * 1024,
             n_slots: 64,
