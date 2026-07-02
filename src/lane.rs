@@ -63,7 +63,10 @@ impl LaneClient {
             // sandboxed/foreign app), pass it so the node resolves its membrane adapter chain
             // and interposes transparently. Absent = the anonymous operator app = direct.
             app: std::env::var("CE_LANE_APP").ok().filter(|s| !s.trim().is_empty()),
-            caps: None,
+            // A purchased/granted capability chain (`ce_cap::encode_chain` hex) to present at
+            // bind (`$CE_LANE_CAPS`) — e.g. a cap bought from an economy adapter, whose ledger
+            // then enforces the budget it sold. Absent = token-only operator bind.
+            caps: std::env::var("CE_LANE_CAPS").ok().filter(|s| !s.trim().is_empty()),
             slot_size: 64 * 1024,
             n_slots: 64,
         };
