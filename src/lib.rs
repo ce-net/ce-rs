@@ -526,9 +526,13 @@ impl CeClient {
     }
 
     /// Find the NodeId hexes of nodes advertising a named service (`GET /discovery/find/:service`).
+    /// The name is percent-encoded: the route is a single path segment, so an unencoded `/` in a
+    /// service name (the common `app/role` convention) would 404.
     pub async fn find_service(&self, service: &str) -> Result<Vec<String>> {
-        let v: serde_json::Value =
-            json(self.http.get(self.url(&format!("/discovery/find/{service}"))).send().await?).await?;
+        let v: serde_json::Value = json(
+            self.http.get(self.url(&format!("/discovery/find/{}", encode_path_segment(service)))).send().await?,
+        )
+        .await?;
         Ok(v["providers"]
             .as_array()
             .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
@@ -611,6 +615,20 @@ async fn ok(resp: reqwest::Response) -> Result<()> {
     } else {
         Err(anyhow!("CE API {status}: {}", resp.text().await.unwrap_or_default()))
     }
+}
+
+/// Percent-encode a value used as ONE path segment (RFC 3986 unreserved chars pass through).
+/// Needed for user-chosen names in path-routed endpoints — e.g. service names like
+/// `ce-hetzner/control`, where a raw `/` would add a path segment and 404.
+fn encode_path_segment(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 // ----- wire types (mirror the node's JSON; amounts are base-unit strings) -----
@@ -825,6 +843,15 @@ mod tests {
     #[test]
     fn local_uses_default_base() {
         assert_eq!(CeClient::local().base_url(), DEFAULT_BASE_URL);
+    }
+
+    #[test]
+    fn path_segment_encoding_protects_service_names() {
+        // A `/` in a service name must not become a path separator (it 404'd find_service for the
+        // common `app/role` naming convention, e.g. ce-hetzner/control).
+        assert_eq!(encode_path_segment("ce-hetzner/control"), "ce-hetzner%2Fcontrol");
+        assert_eq!(encode_path_segment("plain-name_1.0~x"), "plain-name_1.0~x");
+        assert_eq!(encode_path_segment("a b%c"), "a%20b%25c");
     }
 
     #[test]
