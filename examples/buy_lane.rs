@@ -52,7 +52,7 @@ async fn main() -> anyhow::Result<()> {
     // Sign the receipt: cumulative = everything this channel has ever paid + the new budget.
     let cumulative = prior.saturating_add(budget);
     let receipt = ce
-        .channel_receipt(&channel_id, &host, Amount::from_base(cumulative.min(i128::MAX as u128) as i128))
+        .sign_receipt(&channel_id, &host, Amount::from_base(cumulative.min(i128::MAX as u128) as i128))
         .await?;
 
     // Ask the host's economy adapter to admit us for that receipt.

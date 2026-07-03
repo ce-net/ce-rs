@@ -157,6 +157,17 @@ impl CeClient {
         }
         self.lane_cell
             .get_or_init(|| {
+                // An ENDOWED endpoint first: the host pre-bound this app's node channel at
+                // spawn (membrane policy applied there) and passed its fds — no socket, no
+                // token. A present-but-broken endowment does NOT fall through to a socket
+                // dial: the host wired this channel deliberately; dialing around it would
+                // bypass whatever it composed.
+                if let Some(endowed) = ce_lane::claim_endowed() {
+                    return match endowed {
+                        Ok(ep) => Some(std::sync::Arc::new(lane::LaneClient::from_endpoint(ep))),
+                        Err(_) => None,
+                    };
+                }
                 let path = lane::socket_path()?;
                 let token = self.token.clone()?;
                 lane::LaneClient::bind(&path, &token).ok().map(std::sync::Arc::new)
