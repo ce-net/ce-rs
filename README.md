@@ -54,7 +54,31 @@ A typed async client over the full node HTTP + SSE API:
 
 **Feature flags.** `serve` adds the mesh-app request/reply loop (`serve` / `serve_where` +
 `Handler` / `Request` in `src/serve.rs`). `locate` adds service discovery (`locate` / `call` /
-`register` + `Instance` / `LocateOpts` in `src/locate.rs`).
+`register` + `Instance` / `LocateOpts` in `src/locate.rs`). `capability` (pulls both) is the
+**typed capability layer** (`src/capability.rs`) — the "functions and SDKs" over serve+locate.
+
+**Typed capabilities — the mesh as one computer's standard library.** Define a capability ONCE
+as a `Capability` type (a name + `Req`/`Resp`); a provider serves it with a plain async closure
+via `provide`, and any node calls it with `call` — type-safe, with discovery, transport, NAT
+traversal, serialization, and reply-error propagation handled for you. The caller never touches a
+wire; the provider still authorizes the authenticated `Caller`. See `examples/capability_greet.rs`
+(two terminals: `... -- provide` and `... -- call Ada`). Every capability-providing app you install
+adds a function to the mesh's growing standard library, callable identically from a laptop, the
+relay, a browser, or an embedded board.
+
+```rust
+// Shared contract (provider + caller both use this type):
+pub struct Greet;
+impl Capability for Greet { const NAME: &str = "demo.greet"; type Req = GreetReq; type Resp = GreetResp; }
+
+// Provider (a plain async fn):
+provide::<Greet, _>(&ce, |req, _caller| async move {
+    Ok(GreetResp { text: format!("hello {}", req.name) })
+}, std::future::pending::<()>()).await?;
+
+// Caller (typed, one line, transport-agnostic):
+let resp = call::<Greet>(&ce, &GreetReq { name: "world".into() }).await?;
+```
 
 **Money is integer base units.** `Amount` wraps `i128` base units (`1 credit = 10^18`), never
 floats, and (de)serializes as a decimal string (amounts exceed JSON's 2^53 limit). Use

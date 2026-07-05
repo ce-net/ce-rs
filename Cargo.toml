@@ -39,6 +39,16 @@ serve = ["dep:tokio", "dep:tracing"]
 # every higher SDK uses to pick which live instance of a service to talk to. Pulls a tokio
 # timer (re-advertise heartbeat) + tracing.
 locate = ["dep:tokio", "dep:tracing"]
+# `capability` is the typed capability layer (ce_rs::capability): define a Capability type ONCE,
+# then `provide` it (a plain async fn) and `call` it with full type safety — discovery, transport,
+# NAT traversal, serialization, and reply-error propagation are handled for you. This is the
+# "functions and SDKs" layer over serve+locate that makes the mesh feel like one computer's
+# standard library. serde_json is already a base dep, so this only re-exports serve + locate.
+capability = ["serve", "locate"]
+
+[[example]]
+name = "capability_greet"
+required-features = ["capability"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "net", "io-util", "process"] }

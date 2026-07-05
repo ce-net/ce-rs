@@ -47,6 +47,9 @@ pub mod serve;
 #[cfg(feature = "locate")]
 pub mod locate;
 
+#[cfg(feature = "capability")]
+pub mod capability;
+
 pub mod wallet;
 pub use wallet::{Balance, Direction, TxQuery, TxRecord, Wallet};
 

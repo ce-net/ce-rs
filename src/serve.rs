@@ -28,10 +28,8 @@
 //!     }
 //! }
 //!
-//! // Serve forever; ctrl_c shuts it down cleanly.
-//! serve(&ce, &["my-app/rpc"], &Echo, async {
-//!     let _ = tokio::signal::ctrl_c().await;
-//! }).await
+//! // Serve until the shutdown future resolves (here: until the process is stopped).
+//! serve(&ce, &["my-app/rpc"], &Echo, std::future::pending::<()>()).await
 //! # }
 //! ```
 
