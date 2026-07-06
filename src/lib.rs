@@ -799,8 +799,20 @@ fn encode_path_segment(s: &str) -> String {
 #[derive(Debug, Clone, Deserialize)]
 pub struct NodeStatus {
     pub node_id: String,
+    /// libp2p peer id (chain-free nodes report this; older economy nodes omit it → empty).
+    #[serde(default)]
+    pub peer_id: String,
+    /// P2P listen port (chain-free nodes report this; older nodes omit it → 0).
+    #[serde(default)]
+    pub listen_port: u16,
+    // ----- chain fields: present on economy nodes, OMITTED by chain-free (--no-economy) nodes.
+    // `#[serde(default)]` so `/status` from a chain-free core (which returns only node/peer/port/
+    // economy) still deserializes; the values are 0, which is what "no chain / no economy" means.
+    #[serde(default)]
     pub height: u64,
+    #[serde(default)]
     pub difficulty: u8,
+    #[serde(default)]
     pub balance: Amount,
     // ----- balance breakdown (additive; older nodes omit these) -----
     /// Spendable balance: `balance` minus all locks (node-clamped at zero).
