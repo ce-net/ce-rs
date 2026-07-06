@@ -4,6 +4,12 @@ Rust SDK for [CE](https://github.com/ce-net/ce) — a typed, async client for ta
 CE node's HTTP API. Build apps (schedulers, dashboards, bots) on the CE compute mesh without
 hand-rolling JSON.
 
+> The reference SDK of the CE polyglot family (`ce-rs` · `@ce-net/sdk` · `ce-py` · `ce-go`). All four
+> are kept behaviorally identical by the [`ce-conformance`](https://github.com/ce-net/ce-conformance)
+> kit; `ce-rs` is driven by its Rust runner. Note: `/status` is substrate-only (`node_id`, `peer_id`,
+> `listen_port`, `economy`); the ledger (height/balance) is the economy adapter's, read via
+> `Wallet::balance()` and 503-gated on a core node.
+
 ```toml
 [dependencies]
 ce-rs = { git = "https://github.com/ce-net/ce-rs" }
