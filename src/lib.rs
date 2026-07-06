@@ -202,10 +202,51 @@ impl CeClient {
         format!("{}{path}", self.base)
     }
 
-    /// Internal: GET a path and decode its JSON body. Used by SDK modules (wallet, ...) that
-    /// build their own paths (with query strings) but want the shared error handling.
-    pub(crate) async fn get_json<T: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<T> {
+    /// Transport hatch: GET a path and decode its JSON body, with the shared error handling and
+    /// auth token attached. This is the SUBSTRATE transport primitive that adapter SDKs (the
+    /// economy ceapp's `ce-economy`, the trust ceapp's `ce-ratio`, …) ride to speak to their
+    /// domain endpoints WITHOUT re-implementing auth/url/error handling. The core SDK owns the
+    /// transport; each adapter SDK owns its own typed domain surface on top. Path may include a
+    /// query string.
+    pub async fn get_json<T: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<T> {
         json(self.http.get(self.url(path)).send().await?).await
+    }
+
+    /// Transport hatch: POST `body` as JSON to `path` and decode the JSON response. See
+    /// [`get_json`](Self::get_json) — the same substrate primitive for adapter SDKs, for mutating
+    /// calls. Retries are the caller's concern (money endpoints must not auto-retry).
+    pub async fn post_json<B: Serialize, T: for<'de> Deserialize<'de>>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<T> {
+        json(self.http.post(self.url(path)).json(body).send().await?).await
+    }
+
+    /// Transport hatch: POST `body` as JSON to `path`, expecting an empty success response.
+    pub async fn post_void<B: Serialize>(&self, path: &str, body: &B) -> Result<()> {
+        ok(self.http.post(self.url(path)).json(body).send().await?).await
+    }
+
+    /// Transport hatch: POST `body` as JSON to `path` and return the raw response BYTES (for
+    /// endpoints that answer with an octet-stream, not JSON — e.g. the economy ceapp's paid
+    /// data fetch). Authenticated like every other call.
+    pub async fn post_bytes<B: Serialize>(&self, path: &str, body: &B) -> Result<Vec<u8>> {
+        let resp = self.http.post(self.url(path)).json(body).send().await?;
+        if !resp.status().is_success() {
+            return Err(anyhow!("CE API {}: {path}", resp.status()));
+        }
+        Ok(resp.bytes().await?.to_vec())
+    }
+
+    /// Transport hatch: open an SSE endpoint and decode its frames into typed `T` events. Rides
+    /// the shared [`sse`] decoder (the generic SSE machinery stays substrate; adapter SDKs bring
+    /// their own event types, e.g. the economy ceapp's `BlockEvent`/`TxEvent`).
+    pub async fn sse_stream<T>(&self, path: &str) -> Result<impl Stream<Item = Result<T>>>
+    where
+        T: for<'de> Deserialize<'de>,
+    {
+        Ok(sse::decode_stream::<T>(self.open_sse(path).await?))
     }
 
     /// Internal: open an SSE endpoint, returning the raw streaming response. Callers feed the
