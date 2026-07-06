@@ -8,10 +8,9 @@
 //! events split across read boundaries — the #1 SSE bug — plus `\n`/`\r`/`\r\n` line endings,
 //! multi-line `data:`, and comments), and yield one typed domain event per frame.
 //!
-//! The event types mirror the `@ce-net/sdk` (TS) decoders 1:1: [`BlockEvent`], [`TxEvent`],
-//! [`Signal`], [`AppMessage`].
+//! Substrate event types here: [`Signal`], [`AppMessage`]. Chain event types (BlockEvent/TxEvent)
+//! moved to the economy ceapp's SDK (`ce_economy`).
 
-use crate::amount::Amount;
 use anyhow::{anyhow, Result};
 use futures_core::Stream;
 use serde::Deserialize;
@@ -140,30 +139,10 @@ fn take_line(s: &str) -> Option<(String, String)> {
     None
 }
 
-// ----- typed stream event types (mirror the TS SDK decoders) -----
-
-/// A newly-accepted block, from `/blocks/stream`.
-#[derive(Debug, Clone, Deserialize)]
-pub struct BlockEvent {
-    pub index: u64,
-    pub hash: String,
-    pub prev_hash: String,
-    pub timestamp: u64,
-    pub miner: String,
-    pub tx_count: u64,
-    pub nonce: u64,
-}
-
-/// A verified transaction, from `/transactions/stream`. `amount` is `Amount::ZERO` for kinds
-/// that carry no value.
-#[derive(Debug, Clone, Deserialize)]
-pub struct TxEvent {
-    pub id: String,
-    pub origin: String,
-    pub kind: String,
-    #[serde(default)]
-    pub amount: Amount,
-}
+// ----- typed stream event types -----
+// The chain event types (`BlockEvent` for `/blocks/stream`, `TxEvent` for `/transactions/stream`)
+// moved to the economy ceapp's SDK (`ce_economy`). The generic SSE decoder below stays substrate;
+// adapter SDKs bring their own event types and call `CeClient::sse_stream::<T>()`.
 
 /// A validated CEP-1 signal, from `/signals/stream`.
 #[derive(Debug, Clone, Deserialize)]
@@ -309,20 +288,18 @@ mod tests {
     }
 
     #[test]
-    fn decodes_typed_block_and_tx_frames() {
+    fn decodes_a_typed_frame_generically() {
+        // The generic decoder stays substrate; adapter SDKs bring their own event types.
+        #[derive(serde::Deserialize)]
+        struct Signalish {
+            id: String,
+            kind: String,
+        }
         let mut d = SseDecoder::new();
-        let frame = "data: {\"index\":3,\"hash\":\"aa\",\"prev_hash\":\"bb\",\"timestamp\":1,\"miner\":\"m\",\"tx_count\":2,\"nonce\":9}\n\n";
-        let evs = d.push(frame.as_bytes());
+        let evs = d.push(b"data: {\"id\":\"t1\",\"kind\":\"Transfer\"}\n\n");
         assert_eq!(evs.len(), 1);
-        let blk: BlockEvent = serde_json::from_str(&evs[0].data).unwrap();
-        assert_eq!(blk.index, 3);
-        assert_eq!(blk.tx_count, 2);
-
-        let mut d2 = SseDecoder::new();
-        let evs2 =
-            d2.push(b"data: {\"id\":\"t1\",\"origin\":\"o\",\"kind\":\"Transfer\",\"amount\":\"2500000000000000000\"}\n\n");
-        let tx: TxEvent = serde_json::from_str(&evs2[0].data).unwrap();
-        assert_eq!(tx.kind, "Transfer");
-        assert_eq!(tx.amount.credits(), "2.5");
+        let s: Signalish = serde_json::from_str(&evs[0].data).unwrap();
+        assert_eq!(s.id, "t1");
+        assert_eq!(s.kind, "Transfer");
     }
 }

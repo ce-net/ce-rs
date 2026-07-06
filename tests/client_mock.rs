@@ -1,11 +1,14 @@
-//! Mock-HTTP coverage of every `CeClient` method: the happy path (correct request shape sent,
-//! response parsed), and node-error paths (402/404/500, malformed bodies, missing fields).
+//! Mock-HTTP coverage of the substrate `CeClient` methods: the happy path (correct request shape
+//! sent, response parsed), and node-error paths (404/500, malformed bodies, missing fields).
 //!
 //! These run with no node — a hand-rolled mock server ([`common::MockServer`]) returns canned
 //! responses and captures what the SDK sent, so we assert both directions of the contract.
+//!
+//! Money (transfer/bid/deploy/channels/paid-fetch) and reputation (history) moved to the economy
+//! and trust ceapp SDKs (`ce_economy`, `ce_ratio`); their mock tests live there now, not here.
 
 mod common;
-use ce_rs::{Amount, BidSpec, CeClient};
+use ce_rs::CeClient;
 use common::{MockServer, Reply};
 
 fn client_for(server: &MockServer) -> CeClient {
@@ -73,11 +76,11 @@ async fn trailing_slash_in_base_url_is_trimmed() {
 // ---------------------------------------------------------------------------
 
 fn status_json() -> String {
-    r#"{"node_id":"abc","height":42,"difficulty":3,"balance":"5000000000000000000"}"#.into()
+    r#"{"node_id":"abc","peer_id":"p","listen_port":4001,"economy":false}"#.into()
 }
 
 #[tokio::test]
-async fn status_parses_minimal_and_full() {
+async fn status_parses_core_substrate_shape() {
     let server = MockServer::new()
         .route("GET", "/status", Reply::json(200, status_json()))
         .start()
@@ -85,24 +88,20 @@ async fn status_parses_minimal_and_full() {
     let ce = client_for(&server);
     let s = ce.status().await.unwrap();
     assert_eq!(s.node_id, "abc");
-    assert_eq!(s.height, 42);
-    assert_eq!(s.difficulty, 3);
-    assert_eq!(s.balance.credits(), "5");
-    // Optional breakdown absent -> None.
-    assert!(s.free.is_none());
-    assert!(s.bond.is_none());
+    assert_eq!(s.peer_id, "p");
+    assert_eq!(s.listen_port, 4001);
+    assert!(!s.economy_enabled());
 
-    let full = r#"{"node_id":"n","height":1,"difficulty":1,"balance":"10000000000000000000",
-        "free":"6000000000000000000","locked_channels":"3000000000000000000",
-        "locked_bond":"1000000000000000000","bond":"1000000000000000000"}"#;
+    // An economy node's richer /status still decodes (extra chain fields ignored); a missing
+    // `economy` flag is treated as economy-on (the historical default).
+    let full = r#"{"node_id":"n","height":1,"difficulty":1,"balance":"10000000000000000000"}"#;
     let server2 = MockServer::new()
         .route("GET", "/status", Reply::json(200, full))
         .start()
         .await;
     let s2 = client_for(&server2).status().await.unwrap();
-    assert_eq!(s2.free.unwrap().credits(), "6");
-    assert_eq!(s2.locked_channels.unwrap().credits(), "3");
-    assert_eq!(s2.bond.unwrap().credits(), "1");
+    assert_eq!(s2.node_id, "n");
+    assert!(s2.economy_enabled());
 }
 
 #[tokio::test]
@@ -168,51 +167,6 @@ async fn beacon_parses() {
 }
 
 #[tokio::test]
-async fn jobs_list_and_single_and_404() {
-    let list = r#"[{"job_id":"j1","status":"running"},{"job_id":"j2","status":"done","cost":"1000000000000000000"}]"#;
-    let server = MockServer::new()
-        .route("GET", "/jobs", Reply::json(200, list))
-        .route("GET", "/jobs/j1", Reply::json(200, r#"{"job_id":"j1","status":"running","payer":"p"}"#))
-        .route("GET", "/jobs/missing", Reply::text(404, "no such job"))
-        .start()
-        .await;
-    let ce = client_for(&server);
-    let jobs = ce.jobs().await.unwrap();
-    assert_eq!(jobs.len(), 2);
-    assert!(jobs[0].is_running());
-    assert!(!jobs[1].is_running());
-    assert_eq!(jobs[1].cost.unwrap().credits(), "1");
-
-    let j = ce.job("j1").await.unwrap();
-    assert_eq!(j.payer.as_deref(), Some("p"));
-
-    let err = ce.job("missing").await.unwrap_err().to_string();
-    assert!(err.contains("404"), "{err}");
-}
-
-#[tokio::test]
-async fn history_and_newcomer_logic() {
-    let body = r#"{"node_id":"n","jobs_hosted":3,"jobs_paid":1,"heartbeats_hosted":10,
-        "heartbeats_paid":2,"expiries":0,"earned":"5000000000000000000","spent":"1000000000000000000",
-        "first_height":100,"last_height":200}"#;
-    let server = MockServer::new()
-        .route("GET", "/history/n", Reply::json(200, body))
-        .route("GET", "/history/new", Reply::json(200,
-            r#"{"node_id":"new","jobs_hosted":0,"jobs_paid":0,"heartbeats_hosted":0,"heartbeats_paid":0,"expiries":0,"earned":"0","spent":"0","first_height":0,"last_height":0}"#))
-        .start()
-        .await;
-    let ce = client_for(&server);
-    let h = ce.history("n").await.unwrap();
-    assert!(!h.is_newcomer());
-    assert_eq!(h.delivered_work(), 13);
-    assert_eq!(h.earned.credits(), "5");
-
-    let n = ce.history("new").await.unwrap();
-    assert!(n.is_newcomer());
-    assert_eq!(n.delivered_work(), 0);
-}
-
-#[tokio::test]
 async fn revoked_maps_pairs() {
     let body = r#"[{"issuer":"iss1","nonce":7},{"issuer":"iss2","nonce":9}]"#;
     let server = MockServer::new()
@@ -233,174 +187,8 @@ async fn revoked_empty() {
 }
 
 // ---------------------------------------------------------------------------
-// Economy / transfer
+// Kill (directed mesh kill + local kill)
 // ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn transfer_sends_amount_as_base_unit_string_and_returns_tx_id() {
-    let server = MockServer::new()
-        .route_fn("POST", "/transfer", |req| {
-            let v = req.body_json();
-            // Amount must serialize as a base-unit string, not a number.
-            assert_eq!(v["amount"], serde_json::json!("2500000000000000000"));
-            assert_eq!(v["to"], serde_json::json!("dest"));
-            Reply::json(200, r#"{"tx_id":"tx123"}"#)
-        })
-        .start()
-        .await;
-    let tx = client_for(&server)
-        .transfer("dest", Amount::parse_credits("2.5").unwrap())
-        .await
-        .unwrap();
-    assert_eq!(tx, "tx123");
-}
-
-#[tokio::test]
-async fn transfer_402_insufficient_balance() {
-    let server = MockServer::new()
-        .route("POST", "/transfer", Reply::text(402, "insufficient balance"))
-        .start()
-        .await;
-    let err = client_for(&server)
-        .transfer("dest", Amount::from_credits(1))
-        .await
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("402"), "{err}");
-    assert!(err.contains("insufficient"), "{err}");
-}
-
-#[tokio::test]
-async fn transfer_missing_tx_id_yields_empty_string() {
-    // Graceful: a 200 without the expected field returns "" rather than panicking.
-    let server = MockServer::new()
-        .route("POST", "/transfer", Reply::json(200, "{}"))
-        .start()
-        .await;
-    let tx = client_for(&server).transfer("d", Amount::ZERO).await.unwrap();
-    assert_eq!(tx, "");
-}
-
-#[tokio::test]
-async fn transfer_huge_amount_above_2_53_round_trips_on_the_wire() {
-    // 10 billion credits = 10^28 base units, far above 2^53. Must serialize losslessly.
-    let big = Amount::from_credits(10_000_000_000);
-    let server = MockServer::new()
-        .route_fn("POST", "/transfer", |req| {
-            let v = req.body_json();
-            assert_eq!(v["amount"], serde_json::json!("10000000000000000000000000000"));
-            Reply::json(200, r#"{"tx_id":"ok"}"#)
-        })
-        .start()
-        .await;
-    client_for(&server).transfer("d", big).await.unwrap();
-}
-
-// ---------------------------------------------------------------------------
-// Placement
-// ---------------------------------------------------------------------------
-
-fn bidspec() -> BidSpec {
-    BidSpec {
-        image: "alpine:latest".into(),
-        cmd: vec!["echo".into(), "hi".into()],
-        cpu_cores: 2,
-        mem_mb: 256,
-        duration_secs: 60,
-        bid: Amount::from_credits(10),
-    }
-}
-
-#[tokio::test]
-async fn bid_serializes_spec_and_returns_job_id() {
-    let server = MockServer::new()
-        .route_fn("POST", "/jobs/bid", |req| {
-            let v = req.body_json();
-            assert_eq!(v["image"], "alpine:latest");
-            assert_eq!(v["cmd"], serde_json::json!(["echo", "hi"]));
-            assert_eq!(v["cpu_cores"], 2);
-            assert_eq!(v["mem_mb"], 256);
-            assert_eq!(v["bid"], serde_json::json!("10000000000000000000"));
-            Reply::json(200, r#"{"job_id":"job-1"}"#)
-        })
-        .start()
-        .await;
-    assert_eq!(client_for(&server).bid(&bidspec()).await.unwrap(), "job-1");
-}
-
-#[tokio::test]
-async fn bid_402_no_balance() {
-    let server = MockServer::new()
-        .route("POST", "/jobs/bid", Reply::text(402, "no credits"))
-        .start()
-        .await;
-    let err = client_for(&server).bid(&bidspec()).await.unwrap_err().to_string();
-    assert!(err.contains("402"), "{err}");
-}
-
-#[tokio::test]
-async fn mesh_deploy_includes_node_id_and_grant() {
-    let server = MockServer::new()
-        .route_fn("POST", "/mesh-deploy", |req| {
-            let v = req.body_json();
-            assert_eq!(v["node_id"], "host-x");
-            assert_eq!(v["grant"], "cap-token");
-            assert_eq!(v["bid"], serde_json::json!("10000000000000000000"));
-            Reply::json(200, r#"{"job_id":"d-1"}"#)
-        })
-        .start()
-        .await;
-    let id = client_for(&server)
-        .mesh_deploy("host-x", &bidspec(), Some("cap-token"))
-        .await
-        .unwrap();
-    assert_eq!(id, "d-1");
-}
-
-#[tokio::test]
-async fn mesh_deploy_null_grant_when_none() {
-    let server = MockServer::new()
-        .route_fn("POST", "/mesh-deploy", |req| {
-            assert_eq!(req.body_json()["grant"], serde_json::Value::Null);
-            Reply::json(200, r#"{"job_id":"d-2"}"#)
-        })
-        .start()
-        .await;
-    client_for(&server).mesh_deploy("h", &bidspec(), None).await.unwrap();
-}
-
-#[tokio::test]
-async fn mesh_deploy_wasm_returns_deployment_with_output() {
-    let server = MockServer::new()
-        .route_fn("POST", "/mesh-deploy", |req| {
-            let v = req.body_json();
-            assert_eq!(v["wasm_module"], "modhash");
-            assert_eq!(v["wasm_entry"], "_start");
-            assert_eq!(v["inputs"], serde_json::json!(["cidA", "cidB"]));
-            Reply::json(200, r#"{"job_id":"w-1","output":"out-cid"}"#)
-        })
-        .start()
-        .await;
-    let d = client_for(&server)
-        .mesh_deploy_wasm("h", "modhash", "_start", 1, 128, 30, Amount::from_credits(5), None, &["cidA", "cidB"])
-        .await
-        .unwrap();
-    assert_eq!(d.job_id, "w-1");
-    assert_eq!(d.output.as_deref(), Some("out-cid"));
-}
-
-#[tokio::test]
-async fn mesh_deploy_wasm_output_absent_is_none() {
-    let server = MockServer::new()
-        .route("POST", "/mesh-deploy", Reply::json(200, r#"{"job_id":"w-2"}"#))
-        .start()
-        .await;
-    let d = client_for(&server)
-        .mesh_deploy_wasm("h", "m", "e", 1, 128, 30, Amount::ZERO, None, &[])
-        .await
-        .unwrap();
-    assert!(d.output.is_none());
-}
 
 #[tokio::test]
 async fn mesh_kill_and_local_kill() {
@@ -573,40 +361,6 @@ async fn get_object_rejects_unsupported_manifest_kind() {
         .await;
     let err = client_for(&server).get_object(&mcid).await.unwrap_err().to_string();
     assert!(err.contains("unsupported manifest kind"), "{err}");
-}
-
-#[tokio::test]
-async fn fetch_chunk_paid_verifies_status() {
-    let server = MockServer::new()
-        .route_fn("POST", "/data/fetch", |req| {
-            let v = req.body_json();
-            assert_eq!(v["provider"], "prov");
-            assert_eq!(v["cid"], "thecid");
-            assert_eq!(v["cumulative"], serde_json::json!("1000000000000000000"));
-            Reply::bytes(200, "application/octet-stream", b"chunkdata".to_vec())
-        })
-        .start()
-        .await;
-    let got = client_for(&server)
-        .fetch_chunk_paid("prov", "thecid", "chan", Amount::from_credits(1))
-        .await
-        .unwrap();
-    assert_eq!(got, b"chunkdata");
-}
-
-#[tokio::test]
-async fn fetch_chunk_paid_402_is_error() {
-    let server = MockServer::new()
-        .route("POST", "/data/fetch", Reply::text(402, "channel exhausted"))
-        .start()
-        .await;
-    let err = client_for(&server)
-        .fetch_chunk_paid("p", "c", "ch", Amount::ZERO)
-        .await
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("402"), "{err}");
-    assert!(err.contains("paid fetch failed"), "{err}");
 }
 
 // ---------------------------------------------------------------------------
@@ -824,131 +578,4 @@ async fn advertise_tags_stops_at_first_failure() {
     assert!(err.is_err());
     // It stopped at "bad" — "never" was not attempted.
     assert_eq!(CALLS.load(Ordering::SeqCst), 2);
-}
-
-// ---------------------------------------------------------------------------
-// Payment channels
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn channel_open_receipt_close_expire_list() {
-    let server = MockServer::new()
-        .route_fn("POST", "/channels/open", |req| {
-            let v = req.body_json();
-            assert_eq!(v["host"], "h");
-            assert_eq!(v["capacity"], serde_json::json!("100000000000000000000"));
-            assert_eq!(v["expiry_height"], 0);
-            Reply::json(200, r#"{"channel_id":"chan-1"}"#)
-        })
-        .route_fn("POST", "/channels/receipt", |req| {
-            let v = req.body_json();
-            assert_eq!(v["channel_id"], "chan-1");
-            Reply::json(200, r#"{"channel_id":"chan-1","cumulative":"5000000000000000000","payer_sig":"deadbeef"}"#)
-        })
-        .route_fn("POST", "/channels/chan-1/close", |req| {
-            let v = req.body_json();
-            assert_eq!(v["cumulative"], serde_json::json!("5000000000000000000"));
-            assert_eq!(v["payer_sig"], "deadbeef");
-            Reply::empty(200)
-        })
-        .route("POST", "/channels/chan-1/expire", Reply::empty(200))
-        .route("GET", "/channels", Reply::json(200,
-            r#"[{"channel_id":"chan-1","payer":"p","host":"h","capacity":"100000000000000000000","expiry_height":500}]"#))
-        .start()
-        .await;
-    let ce = client_for(&server);
-    let id = ce.channel_open("h", Amount::from_credits(100), 0).await.unwrap();
-    assert_eq!(id, "chan-1");
-    let r = ce.sign_receipt(&id, "h", Amount::from_credits(5)).await.unwrap();
-    assert_eq!(r.payer_sig, "deadbeef");
-    assert_eq!(r.cumulative.credits(), "5");
-    ce.channel_close(&id, r.cumulative, &r.payer_sig).await.unwrap();
-    ce.channel_expire(&id).await.unwrap();
-    let chans = ce.channels().await.unwrap();
-    assert_eq!(chans.len(), 1);
-    assert_eq!(chans[0].expiry_height, 500);
-}
-
-#[tokio::test]
-async fn pay_relay_sends_cumulative() {
-    let server = MockServer::new()
-        .route_fn("POST", "/relay/pay", |req| {
-            let v = req.body_json();
-            assert_eq!(v["relay"], "r");
-            assert_eq!(v["channel_id"], "ch");
-            assert_eq!(v["cumulative"], serde_json::json!("2000000000000000000"));
-            Reply::empty(200)
-        })
-        .start()
-        .await;
-    client_for(&server).pay_relay("r", "ch", Amount::from_credits(2)).await.unwrap();
-}
-
-// ---------------------------------------------------------------------------
-// Wallet over mock
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn wallet_balance_derives_free_on_old_node() {
-    // Old node: only `balance`, no breakdown. free is derived (= total, no locks).
-    let server = MockServer::new()
-        .route("GET", "/status", Reply::json(200, status_json()))
-        .start()
-        .await;
-    let b = client_for(&server).balance().await.unwrap();
-    assert_eq!(b.total.credits(), "5");
-    assert_eq!(b.free.credits(), "5");
-    assert!(b.locked_channels.is_zero());
-    assert!(b.bond.is_zero());
-}
-
-#[tokio::test]
-async fn wallet_balance_uses_node_breakdown() {
-    let full = r#"{"node_id":"n","height":1,"difficulty":1,"balance":"10000000000000000000",
-        "free":"6000000000000000000","locked_channels":"3000000000000000000",
-        "locked_bond":"1000000000000000000","bond":"1000000000000000000"}"#;
-    let server = MockServer::new()
-        .route("GET", "/status", Reply::json(200, full))
-        .start()
-        .await;
-    let b = client_for(&server).balance().await.unwrap();
-    assert_eq!(b.free.credits(), "6");
-    assert_eq!(b.locked_channels.credits(), "3");
-    assert_eq!(b.locked_bond.credits(), "1");
-    // The documented invariant.
-    assert_eq!(
-        b.free.base() + b.locked_channels.base() + b.locked_bond.base(),
-        b.total.base()
-    );
-}
-
-#[tokio::test]
-async fn wallet_transactions_builds_pagination_query() {
-    use ce_rs::TxQuery;
-    let server = MockServer::new()
-        .route_prefix("GET", "/transactions/", Reply::json(200, "[]"))
-        .start()
-        .await;
-    let ce = client_for(&server);
-    let w = ce.wallet();
-    w.transactions("node-x", TxQuery { limit: Some(25), before_height: Some(99) })
-        .await
-        .unwrap();
-    let req = server.last_request().unwrap();
-    assert_eq!(req.path_only(), "/transactions/node-x");
-    let q = req.query().unwrap();
-    assert!(q.contains("limit=25"), "{q}");
-    assert!(q.contains("before=99"), "{q}");
-}
-
-#[tokio::test]
-async fn wallet_transactions_no_query_when_default() {
-    use ce_rs::TxQuery;
-    let server = MockServer::new()
-        .route_prefix("GET", "/transactions/", Reply::json(200, "[]"))
-        .start()
-        .await;
-    client_for(&server).wallet().transactions("n", TxQuery::default()).await.unwrap();
-    let req = server.last_request().unwrap();
-    assert!(req.query().is_none(), "no query string expected, got {:?}", req.query());
 }

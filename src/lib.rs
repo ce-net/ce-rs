@@ -1,33 +1,32 @@
 //! # ce-rs — Rust SDK for CE
 //!
-//! A typed, async client for talking to a **local CE node's HTTP API**. Apps (schedulers,
-//! dashboards, bots) use this instead of hand-rolling JSON: you get `Amount`, `NodeStatus`,
-//! `AtlasEntry`, `Job` and methods that mirror the node's endpoints.
+//! A typed, async client for talking to a **local CE node's HTTP API**. This is the SUBSTRATE
+//! SDK: identity/status, the capacity atlas, content-addressed blobs/objects, mesh app-messaging
+//! (publish/subscribe/send/request/reply/serve), signals, tunnels, and the transport hatch
+//! (`get_json`/`post_json`/`post_void`/`post_bytes`/`sse_stream`) that adapter-ceapp SDKs ride.
+//!
+//! Domain surfaces live in their OWN ceapp SDKs, not here (the modularity law): MONEY —
+//! `Amount`, balances, transfers, payment channels, the paid job market, paid data, chain
+//! streams — is `ce_economy` (the economy ceapp). REPUTATION — `NodeHistory`/`history` — is
+//! `ce_ratio` (the trust ceapp). See PLAN/ce-economy-sdk-extraction.md.
 //!
 //! ```no_run
-//! use ce_rs::{CeClient, BidSpec, Amount};
+//! use ce_rs::CeClient;
 //! # async fn demo() -> anyhow::Result<()> {
 //! let ce = CeClient::local(); // http://127.0.0.1:8844
 //! let status = ce.status().await?;
 //! println!("node {} peer {} economy {}", status.node_id, status.peer_id, status.economy_enabled());
 //!
-//! // Find a GPU host and place a job on it directly (mesh-routed).
+//! // Find a GPU host from the capacity atlas (placement is an adapter-SDK concern).
 //! let hosts = ce.atlas().await?;
 //! if let Some(h) = hosts.iter().find(|h| h.tags.iter().any(|t| t == "gpu")) {
-//!     let spec = BidSpec { image: "alpine:latest".into(), cmd: vec!["echo".into(), "hi".into()],
-//!                          cpu_cores: 1, mem_mb: 128, duration_secs: 60, bid: Amount::from_credits(10) };
-//!     let job_id = ce.mesh_deploy(&h.node_id, &spec, None).await?;
-//!     println!("deployed {job_id} on {}", h.node_id);
+//!     println!("gpu host available: {}", h.node_id);
 //! }
 //! # Ok(()) }
 //! ```
-//!
-//! v0 targets the unauthenticated local-node API (status, atlas, jobs, transfer,
-//! mesh-deploy/kill, signal send). CE-auth signing for direct-to-remote `/exec`,`/sync`
-//! and SSE subscriptions are planned follow-ups.
 
-mod amount;
-pub use amount::{Amount, CREDIT};
+// `Amount`/`CREDIT` (the money scalar) moved to the economy ceapp's SDK (`ce_economy::Amount`).
+// The core substrate SDK carries no money type.
 
 #[cfg(unix)]
 mod lane;
@@ -39,7 +38,7 @@ pub mod data;
 pub use data::{cid, Manifest};
 
 pub mod sse;
-pub use sse::{BlockEvent, Signal, SseDecoder, SseEvent, TxEvent};
+pub use sse::{Signal, SseDecoder, SseEvent};
 
 #[cfg(feature = "serve")]
 pub mod serve;
@@ -50,8 +49,8 @@ pub mod locate;
 #[cfg(feature = "capability")]
 pub mod capability;
 
-pub mod wallet;
-pub use wallet::{Balance, Direction, TxQuery, TxRecord, Wallet};
+// The wallet (Balance/Direction/TxQuery/TxRecord/Wallet — the money view) moved to the economy
+// ceapp's SDK (`ce_economy`).
 
 pub mod tags;
 pub use tags::TagAdvertiser;
@@ -266,20 +265,9 @@ impl CeClient {
     }
 
     // ----- SSE streams -----
-
-    /// Stream every accepted block as it is mined or received (`GET /blocks/stream`). The returned
-    /// [`Stream`] yields `Result<BlockEvent>`; it ends when the connection closes. Reconnect is
-    /// the caller's responsibility (re-call this method).
-    pub async fn blocks_stream(&self) -> Result<impl Stream<Item = Result<BlockEvent>>> {
-        Ok(sse::decode_stream::<BlockEvent>(self.open_sse("/blocks/stream").await?))
-    }
-
-    /// Stream every verified transaction (`GET /transactions/stream`). Each frame is
-    /// `{ id, origin, kind, amount }`; for a wallet-relative view use
-    /// [`Wallet::transactions_stream`](crate::Wallet::transactions_stream).
-    pub async fn transactions_stream_events(&self) -> Result<impl Stream<Item = Result<TxEvent>>> {
-        Ok(sse::decode_stream::<TxEvent>(self.open_sse("/transactions/stream").await?))
-    }
+    // NOTE: the chain streams (`/blocks/stream`, `/transactions/stream` → BlockEvent/TxEvent)
+    // moved to the economy ceapp's SDK (`ce_economy::EconomyClient::{blocks_stream,
+    // transactions_stream}`). The core SDK keeps only the substrate streams below.
 
     /// Stream validated CEP-1 signals (`GET /signals/stream`).
     pub async fn signals_stream(&self) -> Result<impl Stream<Item = Result<Signal>>> {
@@ -361,108 +349,11 @@ impl CeClient {
         json(self.http.get(self.url("/netgraph")).send().await?).await
     }
 
-    /// All jobs known to this node (`GET /jobs`).
-    pub async fn jobs(&self) -> Result<Vec<Job>> {
-        json(self.http.get(self.url("/jobs")).send().await?).await
-    }
-
-    /// One job's status (`GET /jobs/:id`).
-    pub async fn job(&self, job_id: &str) -> Result<Job> {
-        json(self.http.get(self.url(&format!("/jobs/{job_id}"))).send().await?).await
-    }
-
-    /// A node's interaction history — the reputation substrate (`GET /history/:node_id`).
-    /// CE reports immutable facts (jobs hosted, heartbeats, earned/spent); the caller derives
-    /// its own per-relationship trust. Query an archive node for complete history.
-    pub async fn history(&self, node_id: &str) -> Result<NodeHistory> {
-        json(self.http.get(self.url(&format!("/history/{node_id}"))).send().await?).await
-    }
-
-    // ----- economy -----
-
-    /// Transfer credits to another node; returns the tx id (`POST /transfer`).
-    pub async fn transfer(&self, to: &str, amount: Amount) -> Result<String> {
-        let resp = self
-            .http
-            .post(self.url("/transfer"))
-            .json(&serde_json::json!({ "to": to, "amount": amount }))
-            .send()
-            .await?;
-        let v: serde_json::Value = json(resp).await?;
-        Ok(v["tx_id"].as_str().unwrap_or_default().to_string())
-    }
-
-    // ----- placement -----
-
-    /// Broadcast a bid; any host with capacity may accept it. Returns the job id
-    /// (`POST /jobs/bid`). For directed placement use [`mesh_deploy`](Self::mesh_deploy).
-    pub async fn bid(&self, spec: &BidSpec) -> Result<String> {
-        let resp = self.http.post(self.url("/jobs/bid")).json(spec).send().await?;
-        let v: serde_json::Value = json(resp).await?;
-        Ok(v["job_id"].as_str().unwrap_or_default().to_string())
-    }
-
-    /// Directed placement: deploy a cell on a **specific** host over the mesh.
-    /// Returns the host-assigned job id (`POST /mesh-deploy`).
-    pub async fn mesh_deploy(
-        &self,
-        node_id: &str,
-        spec: &BidSpec,
-        grant: Option<&str>,
-    ) -> Result<String> {
-        let body = serde_json::json!({
-            "node_id": node_id,
-            "image": spec.image,
-            "cmd": spec.cmd,
-            "cpu_cores": spec.cpu_cores,
-            "mem_mb": spec.mem_mb,
-            "duration_secs": spec.duration_secs,
-            "bid": spec.bid,
-            "grant": grant,
-        });
-        let resp = self.http.post(self.url("/mesh-deploy")).json(&body).send().await?;
-        let v: serde_json::Value = json(resp).await?;
-        Ok(v["job_id"].as_str().unwrap_or_default().to_string())
-    }
-
-    // Remote exec and file sync/delete used to be SDK methods here (POST /mesh-exec,
-    // PUT/DELETE /mesh-sync). They moved out of CE into the `rdev` app (built on AppRequest +
-    // ce-cap); the SDK no longer wraps them. Apps drive them via `request`/`reply`.
-
-    /// Deploy a **WASM** workload on a specific host over the mesh — the module is referenced by
-    /// its content hash (upload it first with [`put_blob`](Self::put_blob)). `inputs` are
-    /// content-addressed CIDs the host stages from the data layer before launch (Stage 4); pass
-    /// `&[]` for none. (`POST /mesh-deploy`)
-    #[allow(clippy::too_many_arguments)]
-    pub async fn mesh_deploy_wasm(
-        &self,
-        node_id: &str,
-        module_hash: &str,
-        entry: &str,
-        cpu_cores: u32,
-        mem_mb: u64,
-        duration_secs: u64,
-        bid: Amount,
-        grant: Option<&str>,
-        inputs: &[&str],
-    ) -> Result<Deployment> {
-        let body = serde_json::json!({
-            "node_id": node_id,
-            "wasm_module": module_hash,
-            "wasm_entry": entry,
-            "cpu_cores": cpu_cores,
-            "mem_mb": mem_mb,
-            "duration_secs": duration_secs,
-            "bid": bid,
-            "grant": grant,
-            "inputs": inputs,
-        });
-        let v: serde_json::Value = json(self.http.post(self.url("/mesh-deploy")).json(&body).send().await?).await?;
-        Ok(Deployment {
-            job_id: v["job_id"].as_str().unwrap_or_default().to_string(),
-            output: v["output"].as_str().map(|s| s.to_string()),
-        })
-    }
+    // ----- moved to adapter ceapps -----
+    // The paid job market (jobs/job/bid/mesh_deploy/mesh_deploy_wasm, BidSpec/Job/Deployment) and
+    // `transfer` moved to the economy ceapp's SDK (`ce_economy::EconomyClient`). `history()` /
+    // NodeHistory (the reputation substrate) moved to the trust ceapp (`ce_ratio::history`). The
+    // core SDK is substrate only. Remote exec / file sync were earlier moved to the `rdev` app.
 
     /// Upload bytes to the content-addressed blob store; returns the sha256 hash (`POST /blobs`).
     /// Use it to publish a WASM module before deploying it by hash.
@@ -549,30 +440,9 @@ impl CeClient {
         Ok(out)
     }
 
-    /// Paid chunk fetch (data layer Stage 3): authorise `provider` to redeem `cumulative` on
-    /// `channel_id` and pull the chunk `cid` from it over the mesh, paying as we go. `cumulative`
-    /// is the monotonic total for the channel and must cover the running cost of every chunk
-    /// fetched on it so far — the caller tracks it across fetches. Requires an open channel with
-    /// the provider. The returned bytes are verified against `cid`. (`POST /data/fetch`)
-    pub async fn fetch_chunk_paid(
-        &self,
-        provider: &str,
-        cid: &str,
-        channel_id: &str,
-        cumulative: Amount,
-    ) -> Result<Vec<u8>> {
-        let body = serde_json::json!({
-            "provider": provider,
-            "cid": cid,
-            "channel_id": channel_id,
-            "cumulative": cumulative,
-        });
-        let resp = self.http.post(self.url("/data/fetch")).json(&body).send().await?;
-        if !resp.status().is_success() {
-            return Err(anyhow!("CE API {}: paid fetch failed", resp.status()));
-        }
-        Ok(resp.bytes().await?.to_vec())
-    }
+    // Paid chunk fetch (`fetch_chunk_paid`, `/data/fetch`) moved to the economy ceapp's SDK
+    // (`ce_economy::EconomyClient::fetch_chunk_paid`). Free content-addressed blob/object fetch
+    // (`get_blob`/`get_object`) stays here — it is substrate.
 
     // ----- app messaging (docs/app-messaging.md) -----
 
@@ -743,18 +613,8 @@ impl CeClient {
             .unwrap_or_default())
     }
 
-    /// Pay a relay for relay service over the mesh (`POST /relay/pay`). Signs a payment-channel
-    /// receipt authorising `cumulative` total to the relay (the channel host) and sends it; the
-    /// relay verifies it against the channel and its price. Requires an open channel with the
-    /// relay; re-call periodically with a rising `cumulative` to keep paying for ongoing relaying.
-    pub async fn pay_relay(&self, relay: &str, channel_id: &str, cumulative: Amount) -> Result<()> {
-        let body = serde_json::json!({
-            "relay": relay,
-            "channel_id": channel_id,
-            "cumulative": cumulative,
-        });
-        ok(self.http.post(self.url("/relay/pay")).json(&body).send().await?).await
-    }
+    // `pay_relay` (`/relay/pay`) moved to the economy ceapp's SDK
+    // (`ce_economy::EconomyClient::pay_relay`).
 
     /// Stop a job on a specific remote host (`POST /mesh-kill`).
     pub async fn mesh_kill(&self, node_id: &str, job_id: &str, grant: Option<&str>) -> Result<()> {
@@ -767,38 +627,8 @@ impl CeClient {
         ok(self.http.delete(self.url(&format!("/jobs/{job_id}"))).send().await?).await
     }
 
-    // ----- payment channels (docs/payment-channels.md) -----
-
-    /// Open an off-chain payment channel paying `host`, locking `capacity` (`POST /channels/open`).
-    /// Returns the channel id. `expiry_height` 0 uses the node's default lifetime.
-    pub async fn channel_open(&self, host: &str, capacity: Amount, expiry_height: u64) -> Result<String> {
-        let body = serde_json::json!({ "host": host, "capacity": capacity, "expiry_height": expiry_height });
-        let v: serde_json::Value = json(self.http.post(self.url("/channels/open")).json(&body).send().await?).await?;
-        Ok(v["channel_id"].as_str().unwrap_or_default().to_string())
-    }
-
-    /// Sign an off-chain receipt as the payer for `cumulative` total paid (`POST /channels/receipt`).
-    /// Hand the returned receipt to the host; they redeem the highest one to settle.
-    pub async fn sign_receipt(&self, channel_id: &str, host: &str, cumulative: Amount) -> Result<Receipt> {
-        let body = serde_json::json!({ "channel_id": channel_id, "host": host, "cumulative": cumulative });
-        json(self.http.post(self.url("/channels/receipt")).json(&body).send().await?).await
-    }
-
-    /// Redeem a receipt to close a channel (call on the host node) (`POST /channels/:id/close`).
-    pub async fn channel_close(&self, channel_id: &str, cumulative: Amount, payer_sig: &str) -> Result<()> {
-        let body = serde_json::json!({ "cumulative": cumulative, "payer_sig": payer_sig });
-        ok(self.http.post(self.url(&format!("/channels/{channel_id}/close"))).json(&body).send().await?).await
-    }
-
-    /// Reclaim a channel after expiry (call on the payer node) (`POST /channels/:id/expire`).
-    pub async fn channel_expire(&self, channel_id: &str) -> Result<()> {
-        ok(self.http.post(self.url(&format!("/channels/{channel_id}/expire"))).send().await?).await
-    }
-
-    /// List open payment channels (`GET /channels`).
-    pub async fn channels(&self) -> Result<Vec<Channel>> {
-        json(self.http.get(self.url("/channels")).send().await?).await
-    }
+    // Payment channels (channel_open/sign_receipt/channel_close/channel_expire/channels,
+    // Channel/Receipt) moved to the economy ceapp's SDK (`ce_economy::EconomyClient`).
 }
 
 /// Deserialize a successful JSON response, or surface an error with status + body.
@@ -929,39 +759,7 @@ impl AtlasEntry {
     }
 }
 
-/// A bid / deploy spec. Used by [`CeClient::bid`] and [`CeClient::mesh_deploy`].
-#[derive(Debug, Clone, Serialize)]
-pub struct BidSpec {
-    pub image: String,
-    #[serde(default)]
-    pub cmd: Vec<String>,
-    pub cpu_cores: u32,
-    pub mem_mb: u64,
-    pub duration_secs: u64,
-    /// Funding committed for the job.
-    pub bid: Amount,
-}
-
-/// A job record. Fields present depend on the endpoint (`/jobs` vs `/jobs/:id`).
-#[derive(Debug, Clone, Deserialize)]
-pub struct Job {
-    pub job_id: String,
-    pub status: String,
-    #[serde(default)]
-    pub payer: Option<String>,
-    #[serde(default)]
-    pub container_id: Option<String>,
-    #[serde(default)]
-    pub cost: Option<Amount>,
-    #[serde(default)]
-    pub bid: Option<Amount>,
-}
-
-impl Job {
-    pub fn is_running(&self) -> bool {
-        self.status == "running"
-    }
-}
+// BidSpec / Job (the paid job market) moved to the economy ceapp's SDK (`ce_economy`).
 
 /// Result of a one-shot [`CeClient::mesh_exec`].
 #[derive(Debug, Clone, Deserialize)]
@@ -977,34 +775,8 @@ impl ExecResult {
     }
 }
 
-/// An open payment channel.
-#[derive(Debug, Clone, Deserialize)]
-pub struct Channel {
-    pub channel_id: String,
-    pub payer: String,
-    pub host: String,
-    pub capacity: Amount,
-    pub expiry_height: u64,
-}
-
-/// A signed off-chain payment receipt (the payer authorizes `cumulative` total to the host).
-#[derive(Debug, Clone, Deserialize)]
-pub struct Receipt {
-    pub channel_id: String,
-    pub cumulative: Amount,
-    /// Payer's signature (128 hex), redeemed by the host via `channel_close`.
-    pub payer_sig: String,
-}
-
-/// The result of a mesh deploy: the job id, plus an output CID when the workload ran to completion
-/// and produced a captured artifact (a WASI command's stdout — fetch it with [`CeClient::get_object`]
-/// or `get_blob`). `output` is `None` for detached/streaming cells.
-#[derive(Debug, Clone, Deserialize)]
-pub struct Deployment {
-    pub job_id: String,
-    #[serde(default)]
-    pub output: Option<String>,
-}
+// Channel / Receipt (payment channels) and Deployment (paid deploy result) moved to the economy
+// ceapp's SDK (`ce_economy`).
 
 /// A directed application message received from a mesh peer. `from` is the cryptographically
 /// authenticated sender NodeId — trust it to decide what to honor. Use [`payload`](Self::payload)
@@ -1039,35 +811,8 @@ pub struct Beacon {
     pub hash: String,
 }
 
-/// A node's interaction history — the reputation substrate. Immutable facts from the chain;
-/// derive your own trust from them.
-#[derive(Debug, Clone, Deserialize)]
-pub struct NodeHistory {
-    pub node_id: String,
-    pub jobs_hosted: u64,
-    pub jobs_paid: u64,
-    pub heartbeats_hosted: u64,
-    pub heartbeats_paid: u64,
-    pub expiries: u64,
-    pub earned: Amount,
-    pub spent: Amount,
-    pub first_height: u64,
-    pub last_height: u64,
-}
-
-impl NodeHistory {
-    /// A node with no recorded interactions — a stranger (starts at the bottom of the
-    /// trust gradient; only watchable/redundant work).
-    pub fn is_newcomer(&self) -> bool {
-        self.first_height == 0
-    }
-
-    /// A simple default trust heuristic: total work this host delivered and was paid for
-    /// (settled jobs + heartbeats received). Higher = more proven. Apps may define their own.
-    pub fn delivered_work(&self) -> u64 {
-        self.jobs_hosted + self.heartbeats_hosted
-    }
-}
+// NodeHistory (the reputation substrate) moved to the TRUST ceapp's SDK (`ce_ratio::NodeHistory`
+// + `ce_ratio::history::history`). The core SDK is substrate only.
 
 #[cfg(test)]
 mod tests {
@@ -1150,17 +895,6 @@ mod tests {
     }
 
     #[test]
-    fn job_is_running_and_optional_fields() {
-        let running: Job = serde_json::from_str(r#"{"job_id":"j","status":"running"}"#).unwrap();
-        assert!(running.is_running());
-        assert!(running.payer.is_none());
-        let done: Job =
-            serde_json::from_str(r#"{"job_id":"j","status":"settled","cost":"5"}"#).unwrap();
-        assert!(!done.is_running());
-        assert_eq!(done.cost.unwrap().base(), 5);
-    }
-
-    #[test]
     fn exec_result_ok() {
         let ok = ExecResult { stdout: "".into(), stderr: "".into(), exit_code: 0 };
         assert!(ok.ok());
@@ -1176,20 +910,5 @@ mod tests {
         .unwrap();
         assert_eq!(m.payload().unwrap(), b"hello");
         assert!(m.reply_token.is_none());
-    }
-
-    #[test]
-    fn bidspec_serializes_amount_as_string() {
-        let spec = BidSpec {
-            image: "img".into(),
-            cmd: vec![],
-            cpu_cores: 1,
-            mem_mb: 64,
-            duration_secs: 10,
-            bid: Amount::from_credits(3),
-        };
-        let v = serde_json::to_value(&spec).unwrap();
-        assert_eq!(v["bid"], serde_json::json!("3000000000000000000"));
-        assert_eq!(v["cmd"], serde_json::json!([]));
     }
 }

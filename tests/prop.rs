@@ -1,114 +1,19 @@
-//! Property / fuzz tests for the SDK's foundational invariants:
+//! Property / fuzz tests for the SDK's foundational (substrate) invariants:
 //!
-//! - **Amount** money math: parse/format round-trips (incl. values far above 2^53), JSON
-//!   wire round-trips, decimal-place boundaries, sign handling, ordering.
 //! - **Object chunking** (the data-layer Merkle DAG): chunk -> reassemble round-trips for
 //!   arbitrary bytes / chunk sizes; dedup; tamper rejection; CID == sha256.
 //! - **SSE decoder**: feeding the same byte stream in *any* chunk split produces the same frames
 //!   (the #1 SSE bug — chunk-boundary independence), plus CRLF/LF/CR equivalence and comment
 //!   skipping. This is the "random op orders converge identically" analogue for the parser.
 //! - **Tag set logic**: intersection/union semantics over random provider sets.
+//!
+//! `Amount` money math moved to the economy ceapp's SDK (`ce_economy`); its property tests live
+//! there now, not in this substrate-only SDK.
 
 use ce_rs::data::{chunk_object, cid, reassemble, Manifest, MANIFEST_KIND_V1};
 use ce_rs::sse::SseDecoder;
-use ce_rs::Amount;
 use proptest::prelude::*;
 use std::collections::HashMap;
-
-// ---------------------------------------------------------------------------
-// Amount money math
-// ---------------------------------------------------------------------------
-
-proptest! {
-    /// base-unit -> JSON string -> base-unit round-trips for the whole i128 range, including
-    /// values far above 2^53 (the reason amounts are strings on the wire).
-    #[test]
-    fn amount_json_round_trips_full_i128(n in any::<i128>()) {
-        let a = Amount::from_base(n);
-        let j = serde_json::to_string(&a).unwrap();
-        // It must be a *string*, not a bare number.
-        prop_assert!(j.starts_with('"') && j.ends_with('"'));
-        let back: Amount = serde_json::from_str(&j).unwrap();
-        prop_assert_eq!(a, back);
-    }
-
-    /// Human credit decimal -> Amount -> human decimal round-trips for non-negative whole+frac.
-    #[test]
-    fn amount_credit_string_round_trips(whole in 0u64..=u64::MAX, frac in 0u64..1_000_000_000_000_000_000u64) {
-        // Build a canonical decimal string, then ensure parse->credits() reproduces it.
-        let frac_str = format!("{frac:018}");
-        let trimmed = frac_str.trim_end_matches('0');
-        let s = if trimmed.is_empty() {
-            whole.to_string()
-        } else {
-            format!("{whole}.{trimmed}")
-        };
-        let a = Amount::parse_credits(&s).unwrap();
-        prop_assert_eq!(a.credits(), s);
-    }
-
-    /// from_credits(n) is exactly n * 10^18 and formats back to n.
-    #[test]
-    fn from_credits_is_exact(n in 0u64..21_000_000_000u64) {
-        let a = Amount::from_credits(n);
-        prop_assert_eq!(a.base(), n as i128 * 1_000_000_000_000_000_000i128);
-        prop_assert_eq!(a.credits(), n.to_string());
-    }
-
-    /// Negative amounts round-trip and format with a leading '-'.
-    #[test]
-    fn negative_amounts_round_trip(n in i128::MIN..0i128) {
-        let a = Amount::from_base(n);
-        let s = a.credits();
-        prop_assert!(s.starts_with('-'));
-        let reparsed = Amount::parse_credits(&s).unwrap();
-        prop_assert_eq!(a, reparsed);
-    }
-
-    /// Ordering on Amount matches integer ordering on base units.
-    #[test]
-    fn ordering_matches_base(a in any::<i128>(), b in any::<i128>()) {
-        prop_assert_eq!(Amount::from_base(a).cmp(&Amount::from_base(b)), a.cmp(&b));
-    }
-}
-
-#[test]
-fn amount_rejects_more_than_18_decimals() {
-    assert!(Amount::parse_credits("1.0000000000000000001").is_err()); // 19 places
-    assert!(Amount::parse_credits("0.000000000000000000").is_ok()); // 18 zeros ok
-}
-
-#[test]
-fn amount_parses_edge_forms() {
-    assert_eq!(Amount::parse_credits(".5").unwrap().credits(), "0.5");
-    assert_eq!(Amount::parse_credits("  10  ").unwrap().credits(), "10"); // trimmed
-    assert_eq!(Amount::parse_credits("-0").unwrap(), Amount::ZERO);
-    assert_eq!(Amount::parse_credits("0").unwrap(), Amount::ZERO);
-}
-
-#[test]
-fn amount_supply_cap_value_is_exact() {
-    // 21 billion credits — the hard supply cap, ~2.1e28 base units, far beyond u64.
-    let cap = Amount::from_credits(21_000_000_000);
-    assert_eq!(cap.base(), 21_000_000_000i128 * 1_000_000_000_000_000_000i128);
-    // JSON wire form must be the full decimal string.
-    assert_eq!(
-        serde_json::to_string(&cap).unwrap(),
-        "\"21000000000000000000000000000\""
-    );
-}
-
-#[test]
-fn amount_deserializes_with_surrounding_whitespace() {
-    let a: Amount = serde_json::from_str("\"  42  \"").unwrap();
-    assert_eq!(a.base(), 42);
-}
-
-#[test]
-fn amount_rejects_non_integer_wire_string() {
-    let r: Result<Amount, _> = serde_json::from_str("\"1.5\"");
-    assert!(r.is_err(), "wire form is base-unit integers, not decimals");
-}
 
 // ---------------------------------------------------------------------------
 // Object chunking / Merkle DAG

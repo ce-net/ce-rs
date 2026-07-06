@@ -19,7 +19,11 @@ async fn main() -> anyhow::Result<()> {
     let n: u32 = std::env::var("PROBE_MSGS").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
 
     let status = ce.status().await?;
-    println!("node {} at height {}", &status.node_id[..8.min(status.node_id.len())], status.height);
+    println!(
+        "node {} (economy: {})",
+        &status.node_id[..8.min(status.node_id.len())],
+        status.economy_enabled()
+    );
 
     for i in 0..n {
         ce.publish("lane-probe", format!("probe message {i}").as_bytes()).await?;

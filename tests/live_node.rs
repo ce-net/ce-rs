@@ -15,7 +15,7 @@
 
 mod common;
 
-use ce_rs::{Amount, CeClient};
+use ce_rs::CeClient;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU16, Ordering};
@@ -183,16 +183,9 @@ async fn live_single_node_read_endpoints() -> anyhow::Result<()> {
     assert_eq!(beacon.hash.len(), 64, "beacon hash should be 64 hex: {}", beacon.hash);
     assert!(beacon.hash.chars().all(|c| c.is_ascii_hexdigit()));
 
-    // atlas, jobs, channels, revoked: should all return (possibly empty) without error.
+    // atlas, revoked: should return (possibly empty) without error.
     let _atlas = ce.atlas().await?;
-    let jobs = ce.jobs().await?;
-    assert!(jobs.is_empty(), "a fresh node has no jobs");
-    let chans = ce.channels().await?;
-    assert!(chans.is_empty(), "a fresh node has no channels");
     let _revoked = ce.revoked().await?;
-
-    // balance breakdown
-    let _bal = ce.balance().await?;
 
     Ok(())
 }
@@ -252,28 +245,6 @@ async fn live_name_claim_and_discovery() -> anyhow::Result<()> {
     ce.advertise_service("ce-rs-live-service").await?;
     ce.advertise_tag("ce-rs-live-tag").await?;
 
-    Ok(())
-}
-
-#[tokio::test]
-async fn live_status_402_on_insufficient_balance_transfer() -> anyhow::Result<()> {
-    let bin = require_binary!();
-    let node = match EphemeralNode::spawn(&bin, None) {
-        Ok(n) => n,
-        Err(e) => {
-            eprintln!("SKIP: could not spawn ephemeral node: {e}");
-            return Ok(());
-        }
-    };
-    let ce = node.client();
-    // A --no-mine node has zero balance; a big transfer should be rejected (402) -> SDK Err.
-    let res = ce
-        .transfer(
-            "1111111111111111111111111111111111111111111111111111111111111111",
-            Amount::from_credits(1_000_000),
-        )
-        .await;
-    assert!(res.is_err(), "transfer with no balance must error (likely 402)");
     Ok(())
 }
 
