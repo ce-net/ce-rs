@@ -55,6 +55,9 @@ pub mod capability;
 pub mod tags;
 pub use tags::TagAdvertiser;
 
+pub mod app;
+pub use app::AppInstalled;
+
 use anyhow::{anyhow, Result};
 use futures_core::Stream;
 use serde::{Deserialize, Serialize};
