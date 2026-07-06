@@ -9,7 +9,7 @@
 //! # async fn demo() -> anyhow::Result<()> {
 //! let ce = CeClient::local(); // http://127.0.0.1:8844
 //! let status = ce.status().await?;
-//! println!("height {} balance {}", status.height, status.balance);
+//! println!("node {} peer {} economy {}", status.node_id, status.peer_id, status.economy_enabled());
 //!
 //! // Find a GPU host and place a job on it directly (mesh-routed).
 //! let hosts = ce.atlas().await?;
@@ -796,42 +796,31 @@ fn encode_path_segment(s: &str) -> String {
 
 // ----- wire types (mirror the node's JSON; amounts are base-unit strings) -----
 
+/// The core (substrate) node status from `GET /status`. The core node is chain-free: height,
+/// balance, and the rest of the ledger are NOT substrate concepts — they belong to the economy
+/// adapter and its own typed SDK, not this client. `economy` reports whether an economy adapter is
+/// attached.
 #[derive(Debug, Clone, Deserialize)]
 pub struct NodeStatus {
     pub node_id: String,
-    /// libp2p peer id (chain-free nodes report this; older economy nodes omit it → empty).
+    /// libp2p peer id (core nodes report this; older economy nodes omit it → empty).
     #[serde(default)]
     pub peer_id: String,
-    /// P2P listen port (chain-free nodes report this; older nodes omit it → 0).
+    /// P2P listen port (core nodes report this; older nodes omit it → 0).
     #[serde(default)]
     pub listen_port: u16,
-    // ----- chain fields: present on economy nodes, OMITTED by chain-free (--no-economy) nodes.
-    // `#[serde(default)]` so `/status` from a chain-free core (which returns only node/peer/port/
-    // economy) still deserializes; the values are 0, which is what "no chain / no economy" means.
-    #[serde(default)]
-    pub height: u64,
-    #[serde(default)]
-    pub difficulty: u8,
-    #[serde(default)]
-    pub balance: Amount,
-    // ----- balance breakdown (additive; older nodes omit these) -----
-    /// Spendable balance: `balance` minus all locks (node-clamped at zero).
-    #[serde(default)]
-    pub free: Option<Amount>,
-    /// Credits locked in this node's open payment channels.
-    #[serde(default)]
-    pub locked_channels: Option<Amount>,
-    /// Credits locked in this node's active host bond.
-    #[serde(default)]
-    pub locked_bond: Option<Amount>,
-    /// This node's active host bond.
-    #[serde(default)]
-    pub bond: Option<Amount>,
-    /// Whether the node runs the economy. `Some(false)` = personal-mesh mode (no chain,
-    /// jobs, or credits; the economic endpoints answer 503). `None` on older nodes that
-    /// predate the field — treat as `true` (economy on), the historical default.
+    /// Whether an economy adapter runs on this node. `Some(false)` = core/personal-mesh (the ledger
+    /// and economic endpoints answer 503). `None` on older nodes predating the field — treat as
+    /// `true` (economy on), the historical default.
     #[serde(default)]
     pub economy: Option<bool>,
+}
+
+impl NodeStatus {
+    /// Whether an economy adapter is attached (a `None` flag means an older economy node).
+    pub fn economy_enabled(&self) -> bool {
+        self.economy.unwrap_or(true)
+    }
 }
 
 /// One live ce-lane flow as reported by `GET /lanes` — the metering readout an economy adapter
@@ -1093,15 +1082,20 @@ mod tests {
     }
 
     #[test]
-    fn node_status_optional_breakdown_defaults_to_none() {
+    fn node_status_decodes_core_substrate_shape() {
+        // A core node returns only node_id/peer_id/listen_port/economy; chain fields are ignored.
         let s: NodeStatus = serde_json::from_str(
-            r#"{"node_id":"n","height":1,"difficulty":1,"balance":"0"}"#,
+            r#"{"node_id":"n","peer_id":"p","listen_port":4001,"economy":false}"#,
         )
         .unwrap();
-        assert!(s.free.is_none());
-        assert!(s.locked_channels.is_none());
-        assert!(s.locked_bond.is_none());
-        assert!(s.bond.is_none());
+        assert_eq!(s.node_id, "n");
+        assert_eq!(s.peer_id, "p");
+        assert_eq!(s.listen_port, 4001);
+        assert!(!s.economy_enabled());
+        // And it still decodes an economy node's richer /status (extra fields ignored).
+        let e: NodeStatus =
+            serde_json::from_str(r#"{"node_id":"n","height":1,"balance":"0","economy":true}"#).unwrap();
+        assert!(e.economy_enabled());
     }
 
     #[test]

@@ -11,10 +11,29 @@
 
 use crate::amount::Amount;
 use crate::sse::{decode_stream, TxEvent};
-use crate::{Channel, CeClient, NodeStatus, Receipt};
-use anyhow::Result;
+use crate::{Channel, CeClient, Receipt};
+use anyhow::{anyhow, Result};
 use futures_core::Stream;
 use serde::Deserialize;
+
+/// The ledger view parsed from `/status` on an economy node. These are economy-adapter concepts,
+/// not substrate, so they are NOT on the core `NodeStatus`; the wallet reads them here. (This whole
+/// surface moves to the economy adapter's own SDK.)
+#[derive(Debug, Default, Deserialize)]
+struct LedgerStatus {
+    #[serde(default)]
+    balance: Amount,
+    #[serde(default)]
+    free: Option<Amount>,
+    #[serde(default)]
+    locked_channels: Option<Amount>,
+    #[serde(default)]
+    locked_bond: Option<Amount>,
+    #[serde(default)]
+    bond: Option<Amount>,
+    #[serde(default)]
+    economy: Option<bool>,
+}
 
 /// A node's credit balance, split into spendable and locked buckets. Invariant (when the node
 /// is fully synced): `free + locked_channels + locked_bond == total`.
@@ -103,7 +122,12 @@ impl Wallet {
     /// `bond` when the node reports them; on older nodes that only return `balance`, the locked
     /// buckets are zero and `free == total`.
     pub async fn balance(&self) -> Result<Balance> {
-        let s: NodeStatus = self.client.status().await?;
+        let s: LedgerStatus = self.client.get_json("/status").await?;
+        if s.economy == Some(false) {
+            return Err(anyhow!(
+                "economy is disabled on this node (core/personal-mesh) — the ledger lives in the economy adapter"
+            ));
+        }
         let total = s.balance;
         let locked_channels = s.locked_channels.unwrap_or(Amount::ZERO);
         let locked_bond = s.locked_bond.unwrap_or(Amount::ZERO);
