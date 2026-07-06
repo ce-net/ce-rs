@@ -7,15 +7,15 @@
 //!
 //! It composes only existing node primitives — DHT service discovery
 //! ([`CeClient::find_service`](crate::CeClient::find_service)), the capacity atlas
-//! ([`CeClient::atlas`](crate::CeClient::atlas)), per-node reputation
-//! ([`CeClient::history`](crate::CeClient::history)), and the verifiable randomness beacon
+//! ([`CeClient::atlas`](crate::CeClient::atlas)) and the verifiable randomness beacon
 //! ([`CeClient::beacon`](crate::CeClient::beacon)) — so there are no new node RPCs and nothing is
-//! routed off the mesh.
+//! routed off the mesh. Reputation-weighted selection is a TRUST concern (the `ce-ratio`/`ce-lb`
+//! ceapps) layered on top, not a substrate concern.
 //!
 //! ## Selection
 //!
-//! [`locate`] discovers the instances advertising a service, then ranks the live ones by **trust**
-//! (on-chain delivered-and-paid work), **capacity** (free cores/memory), and **recency**, with a
+//! [`locate`] discovers the instances advertising a service, then ranks the live ones by
+//! **capacity** (free cores/memory) and **recency**, with a
 //! **beacon-seeded** deterministic tiebreak so the choice is reproducible and unsteerable. When more
 //! than one instance is requested for redundancy, candidates are **spread across distinct fault
 //! domains** (region / zone / ASN tags) so one datacenter or operator loss does not take them all.
@@ -135,16 +135,10 @@ pub async fn locate(ce: &CeClient, service: &str, opts: &LocateOpts) -> Result<V
             continue;
         }
 
-        // Trust: on-chain delivered-and-paid work, log-saturated; a stranger scores 0. Best-effort
-        // (a history read failure degrades this instance's trust to 0 rather than dropping it).
-        let trust = match ce.history(&id).await {
-            Ok(h) if !h.is_newcomer() => {
-                let delivered = (h.jobs_paid + h.heartbeats_paid) as f64;
-                (1.0 + delivered).ln()
-            }
-            _ => 0.0,
-        };
-        let trust_norm = (trust / 10.0).min(1.0); // ~22k delivered units saturates
+        // NOTE: reputation-weighted selection is a TRUST concern, not substrate — it moved to the
+        // trust ceapp (`ce-ratio` / `ce-lb`, which rank candidates by on-chain delivered-and-paid
+        // work). Substrate `locate` ranks by capacity + recency only; wrap this with the trust
+        // ceapp when you want reputation-biased placement.
 
         // Capacity headroom (rough): free cores (total minus running jobs) + memory, normalized to
         // soft ceilings.
@@ -158,7 +152,7 @@ pub async fn locate(ce: &CeClient, service: &str, opts: &LocateOpts) -> Result<V
         // Deterministic, beacon-seeded jitter for reproducible tiebreaks nobody can steer.
         let jitter = beacon_jitter(&id, &beacon_hash);
 
-        let score = 0.5 * trust_norm + 0.3 * cap + 0.2 * recency + 0.001 * jitter;
+        let score = 0.6 * cap + 0.4 * recency + 0.001 * jitter;
         scored.push(Instance {
             node_id: id.clone(),
             score,
