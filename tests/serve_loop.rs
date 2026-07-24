@@ -345,6 +345,102 @@ async fn reconnects_after_stream_open_failure_with_backoff() {
 }
 
 // ---------------------------------------------------------------------------
+// Node-restart deafness: re-subscribe on every stream (re)connect
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn resubscribes_after_every_stream_reconnect() {
+    // THE deafness bug (observed live 3x on 2026-07-24): the node keeps /mesh/subscribe state in
+    // memory, so a node restart wipes it; the serve loop's stream reconnect (which always worked)
+    // then reattaches to a node that no longer routes the topic — permanently deaf. The loop must
+    // therefore re-POST /mesh/subscribe for every served topic on EVERY stream (re)connect, not
+    // just once at startup. Model: the first stream connection ends immediately (the stream dying
+    // with the node), the next carries a request.
+    let opens = Arc::new(AtomicUsize::new(0));
+    let sink = ReplySink::default();
+    let body = request_frame("alice", "app/rpc", b"after-restart", 9);
+    let o = opens.clone();
+    let server = MockServer::new()
+        .route("POST", "/mesh/subscribe", Reply::json(200, "{\"status\":\"subscribed\"}"))
+        .route_fn("GET", "/mesh/messages/stream", move |_req| {
+            if o.fetch_add(1, Ordering::SeqCst) == 0 {
+                Reply::sse(String::new(), None) // dies immediately -> forces a reconnect
+            } else {
+                Reply::sse(body.clone(), None)
+            }
+        })
+        .route_fn("POST", "/mesh/reply", {
+            let s = sink.clone();
+            move |req| s.record(req)
+        })
+        .start()
+        .await;
+
+    run_until_replies(&server, vec!["app/rpc".into()], &RecordingHandler::default(), sink, 1).await;
+
+    // With >=2 stream connections there must be >=2 subscribes, and at least one of them must
+    // come AFTER the second stream open — i.e. the reconnect re-armed the subscription.
+    let reqs = server.requests();
+    let stream_idx: Vec<usize> = reqs
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.method == "GET" && r.path_only() == "/mesh/messages/stream")
+        .map(|(i, _)| i)
+        .collect();
+    let sub_idx: Vec<usize> = reqs
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.method == "POST" && r.path_only() == "/mesh/subscribe")
+        .map(|(i, _)| i)
+        .collect();
+    assert!(stream_idx.len() >= 2, "test premise: the stream must have reconnected");
+    assert!(
+        sub_idx.len() >= 2,
+        "serve must re-subscribe on every stream (re)connect (node restarts lose subscribe \
+         state); got {} subscribe(s) across {} stream connection(s)",
+        sub_idx.len(),
+        stream_idx.len()
+    );
+    assert!(
+        sub_idx.iter().any(|&i| i > stream_idx[1]),
+        "no re-subscribe after the stream reconnected: subscribes at {sub_idx:?}, stream opens at {stream_idx:?}"
+    );
+}
+
+#[tokio::test]
+async fn subscribes_after_stream_open_but_before_processing() {
+    // Startup-race hardening: the chosen ordering is stream-open FIRST, then subscribe, then
+    // process. The node confirms /mesh/subscribe synchronously, so once subscribe returns, every
+    // later message flows into the already-open stream — no window where a message arrives
+    // subscribed-but-unstreamed (subscribe-then-open would have one) or unsubscribed.
+    let body = request_frame("alice", "app/rpc", b"x", 2);
+    let sink = ReplySink::default();
+    let server = node_serving(body, sink.clone()).await;
+
+    run_until_replies(&server, vec!["app/rpc".into()], &RecordingHandler::default(), sink, 1).await;
+
+    let reqs = server.requests();
+    let first_stream = reqs
+        .iter()
+        .position(|r| r.method == "GET" && r.path_only() == "/mesh/messages/stream")
+        .expect("stream was opened");
+    let first_sub = reqs
+        .iter()
+        .position(|r| r.method == "POST" && r.path_only() == "/mesh/subscribe")
+        .expect("topic was subscribed");
+    let first_reply = reqs
+        .iter()
+        .position(|r| r.method == "POST" && r.path_only() == "/mesh/reply")
+        .expect("request was answered");
+    assert!(
+        first_stream < first_sub,
+        "subscribe must follow the stream open (close the subscribed-but-unstreamed window): \
+         stream at {first_stream}, subscribe at {first_sub}"
+    );
+    assert!(first_sub < first_reply, "no request may be answered before the topic is subscribed");
+}
+
+// ---------------------------------------------------------------------------
 // Shutdown
 // ---------------------------------------------------------------------------
 

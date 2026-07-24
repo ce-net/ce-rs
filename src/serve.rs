@@ -2,10 +2,17 @@
 //!
 //! A mesh app answers requests over the CE mesh (libp2p `request`/`reply` on `/ce/rpc/1`), reached
 //! by NodeId with relay/NAT traversal — never over a stored ip:port or a side HTTP channel. This
-//! module is the one correct implementation of that serve loop: subscribe to the request topics,
-//! read the node's inbound message stream, and answer each request via a [`Handler`], reconnecting
+//! module is the one correct implementation of that serve loop: open the node's inbound message
+//! stream, subscribe to the request topics, and answer each request via a [`Handler`], reconnecting
 //! with backoff and de-duplicating redelivered requests. It codifies the loop that `ce-fn` and
 //! `rdev` previously hand-rolled so every mesh app shares it.
+//!
+//! The node keeps `/mesh/subscribe` state in memory only, so a node restart silently wipes it.
+//! The loop therefore re-subscribes every served topic on EVERY stream (re)connect — never only
+//! once at startup — so a service survives its node restarting instead of going permanently deaf.
+//! Ordering per connection is stream-open first, then subscribe, then process: the node confirms
+//! `/mesh/subscribe` synchronously, so once it returns, every later message flows into the
+//! already-open stream (no subscribed-but-unstreamed window).
 //!
 //! ## Authorization is the app's job
 //!
@@ -36,6 +43,8 @@
 use crate::{AppMessage, CeClient};
 use anyhow::Result;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// An incoming mesh request delivered to a [`Handler`].
@@ -62,12 +71,14 @@ pub trait Handler: Send + Sync {
     fn handle(&self, req: Request) -> impl std::future::Future<Output = Vec<u8>> + Send;
 }
 
-/// Serve an explicit set of `topics` until `shutdown` resolves: subscribe to each, then answer every
-/// incoming request from the node's inbound message stream via `handler`, replying over the mesh.
+/// Serve an explicit set of `topics` until `shutdown` resolves: answer every incoming request from
+/// the node's inbound message stream via `handler`, replying over the mesh. Each topic is
+/// (re-)subscribed on every stream (re)connect, so the service survives its node restarting.
 ///
-/// Reconnects to the message stream with exponential backoff (capped at 10s), and de-duplicates by
-/// reply token so a request redelivered after a reconnect is answered at most once. Non-request
-/// messages (no `reply_token`) and messages on other topics are ignored.
+/// Reconnects to the message stream with exponential backoff (capped at 10s), rides out transient
+/// subscribe failures the same way, and de-duplicates by reply token so a request redelivered after
+/// a reconnect is answered at most once. Non-request messages (no `reply_token`) and messages on
+/// other topics are ignored.
 pub async fn serve<H: Handler>(
     ce: &CeClient,
     topics: &[&str],
@@ -96,17 +107,35 @@ where
     H: Handler,
     F: Fn(&str) -> bool,
 {
-    use futures_util::StreamExt as _;
+    serve_where_signal(ce, subscribe, accept, handler, shutdown, None).await
+}
 
-    for t in subscribe {
-        ce.subscribe(t).await?;
-    }
+/// [`serve_where`] plus an optional readiness flag, set to `true` the first time a stream is open
+/// AND every subscribed topic has been CONFIRMED by the node (`/mesh/subscribe` returns
+/// synchronously — that is the confirmation). `capability::provide` gates its first DHT advertise
+/// on this, so a caller can never locate an instance whose node would still drop its requests.
+pub(crate) async fn serve_where_signal<H, F>(
+    ce: &CeClient,
+    subscribe: &[&str],
+    accept: F,
+    handler: &H,
+    shutdown: impl std::future::Future<Output = ()>,
+    subscribed: Option<Arc<AtomicBool>>,
+) -> Result<()>
+where
+    H: Handler,
+    F: Fn(&str) -> bool,
+{
+    use futures_util::StreamExt as _;
 
     let mut seen: HashSet<u64> = HashSet::new();
     let mut backoff_ms = 250u64;
     tokio::pin!(shutdown);
 
     loop {
+        // Open the inbound stream FIRST. Subscribing after guarantees no message can arrive
+        // subscribed-but-unstreamed: the node confirms /mesh/subscribe synchronously, so every
+        // message routed after that confirmation lands in this already-open stream.
         let stream = match ce.messages_stream().await {
             Ok(s) => s,
             Err(e) => {
@@ -119,8 +148,33 @@ where
                 continue;
             }
         };
-        backoff_ms = 250;
         tokio::pin!(stream);
+
+        // (Re-)subscribe every topic on EVERY (re)connect: the node holds subscribe state in
+        // memory only, so a node restart wipes it — a loop that only subscribed at startup would
+        // reattach its stream to a node that no longer routes the topics and go permanently deaf.
+        // A subscribe failure is transient node trouble (e.g. still starting up): drop this
+        // connection and retry the whole connect with backoff rather than erroring out.
+        let mut sub_failed = false;
+        for t in subscribe {
+            if let Err(e) = ce.subscribe(t).await {
+                tracing::warn!(topic = %t, error = %e, "serve: subscribe failed; reconnecting");
+                sub_failed = true;
+                break;
+            }
+        }
+        if sub_failed {
+            tokio::select! {
+                _ = &mut shutdown => return Ok(()),
+                _ = tokio::time::sleep(Duration::from_millis(backoff_ms)) => {}
+            }
+            backoff_ms = (backoff_ms * 2).min(10_000);
+            continue;
+        }
+        if let Some(flag) = &subscribed {
+            flag.store(true, Ordering::Release);
+        }
+        backoff_ms = 250;
 
         loop {
             tokio::select! {

@@ -215,23 +215,45 @@ where
     P: Provider<C>,
 {
     use futures_util::future::FutureExt as _;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
 
     // Fan the single shutdown into both loops so they stop together, without needing a tokio
     // runtime handle (`tokio::spawn`) — keeps the SDK's tokio feature footprint to time+macros.
     let shutdown = shutdown.shared();
 
-    // Keep this node discoverable as a live instance of the capability, concurrently with serving.
+    // Keep this node discoverable as a live instance of the capability, concurrently with serving —
+    // but hold the FIRST advertise until the serve loop has a CONFIRMED topic subscription.
+    // Advertising earlier would let a caller locate this instance and fire a request into a node
+    // that is not yet routing the topic; the node drops it and the caller times out. The flag is an
+    // AtomicBool polled on the existing tokio timer (no tokio `sync` feature needed).
+    let ready = Arc::new(AtomicBool::new(false));
     let reg_ce = ce.clone();
     let name = C::NAME.to_string();
     let reg_shutdown = shutdown.clone();
+    let reg_ready = ready.clone();
     let register = async move {
+        while !reg_ready.load(Ordering::Acquire) {
+            tokio::select! {
+                () = reg_shutdown.clone() => return, // shut down before ever becoming ready
+                _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+            }
+        }
         let _ = locate::register(&reg_ce, &name, advertise_interval, reg_shutdown).await;
     };
 
     let handler = CapHandler::<C, P> { provider, _pd: PhantomData };
     let topic = topic::<C>();
     let topics = [topic.as_str()];
-    let serve = serve::serve(ce, &topics, &handler, shutdown);
+    let set: std::collections::HashSet<String> = topics.iter().map(|t| t.to_string()).collect();
+    let serve = serve::serve_where_signal(
+        ce,
+        &topics,
+        move |t| set.contains(t),
+        &handler,
+        shutdown,
+        Some(ready),
+    );
 
     // Run both to completion; each returns when the shared shutdown fires.
     let (serve_res, ()) = futures_util::future::join(serve, register).await;
