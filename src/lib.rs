@@ -105,6 +105,20 @@ pub fn discover_api_token() -> Option<String> {
 /// falling back to HTTP silently on any lane absence or failure. Same node-side `AppBus`
 /// either way, so apps observe identical behavior.
 #[derive(Debug, Clone)]
+/// Percent-encode a query-string value (topics are app-chosen strings; `/` and `.` are common).
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b',' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 pub struct CeClient {
     base: String,
     http: reqwest::Client,
@@ -278,8 +292,20 @@ impl CeClient {
     }
 
     /// Stream inbound app messages (`GET /mesh/messages/stream`) — the push counterpart to
-    /// polling [`messages`](Self::messages).
+    /// polling [`messages`](Self::messages). Every topic; see
+    /// [`messages_stream_for`](Self::messages_stream_for) to declare what you actually want.
     pub async fn messages_stream(&self) -> Result<impl Stream<Item = Result<AppMessage>>> {
+        self.messages_stream_for(&[]).await
+    }
+
+    /// Stream ONLY the topics this app serves. The node honors the list at the source: traffic
+    /// belonging to other apps is never encoded and never sent here, so a node's cost scales
+    /// with what each app asked for instead of with how many apps are installed. An empty list
+    /// means "everything" (the historic behaviour).
+    pub async fn messages_stream_for(
+        &self,
+        topics: &[String],
+    ) -> Result<impl Stream<Item = Result<AppMessage>>> {
         use futures_util::StreamExt;
         // Same-host fast path: the node PUSHES inbound messages over the lane (Watch/Event) —
         // identical content to the SSE stream, no HTTP, no polling. Falls back silently.
@@ -299,7 +325,12 @@ impl CeClient {
                     .boxed());
             }
         }
-        Ok(sse::decode_stream::<AppMessage>(self.open_sse("/mesh/messages/stream").await?).boxed())
+        let path = if topics.is_empty() {
+            "/mesh/messages/stream".to_string()
+        } else {
+            format!("/mesh/messages/stream?topics={}", urlencode(&topics.join(",")))
+        };
+        Ok(sse::decode_stream::<AppMessage>(self.open_sse(&path).await?).boxed())
     }
 
     // ----- read -----

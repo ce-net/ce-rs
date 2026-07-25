@@ -86,7 +86,11 @@ pub async fn serve<H: Handler>(
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<()> {
     let set: HashSet<String> = topics.iter().map(|t| t.to_string()).collect();
-    serve_where(ce, topics, move |t| set.contains(t), handler, shutdown).await
+    // An exact topic list, so the node can filter at the source: this app is never woken for
+    // another app's traffic. `serve_where` cannot do this — its predicate may accept topics
+    // nobody enumerated (families, dynamic sub-topics) — so it keeps the full stream.
+    let declared: Vec<String> = set.iter().cloned().collect();
+    serve_where_signal(ce, topics, move |t| set.contains(t), handler, shutdown, None, &declared).await
 }
 
 /// The general serve loop: answer every inbound request whose topic satisfies `accept`. Use this
@@ -107,7 +111,7 @@ where
     H: Handler,
     F: Fn(&str) -> bool,
 {
-    serve_where_signal(ce, subscribe, accept, handler, shutdown, None).await
+    serve_where_signal(ce, subscribe, accept, handler, shutdown, None, &[]).await
 }
 
 /// [`serve_where`] plus an optional readiness flag, set to `true` the first time a stream is open
@@ -121,6 +125,9 @@ pub(crate) async fn serve_where_signal<H, F>(
     handler: &H,
     shutdown: impl std::future::Future<Output = ()>,
     subscribed: Option<Arc<AtomicBool>>,
+    /// Topics to ask the node to restrict this stream to. EMPTY = everything, which is the only
+    /// safe default when `accept` may match topics that were never enumerated.
+    stream_topics: &[String],
 ) -> Result<()>
 where
     H: Handler,
@@ -136,7 +143,7 @@ where
         // Open the inbound stream FIRST. Subscribing after guarantees no message can arrive
         // subscribed-but-unstreamed: the node confirms /mesh/subscribe synchronously, so every
         // message routed after that confirmation lands in this already-open stream.
-        let stream = match ce.messages_stream().await {
+        let stream = match ce.messages_stream_for(stream_topics).await {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(error = %e, "serve: messages_stream open failed; backing off");

@@ -246,6 +246,8 @@ where
     let topic = topic::<C>();
     let topics = [topic.as_str()];
     let set: std::collections::HashSet<String> = topics.iter().map(|t| t.to_string()).collect();
+    // One exact topic — declare it, so the node never wakes this capability for other traffic.
+    let declared: Vec<String> = set.iter().cloned().collect();
     let serve = serve::serve_where_signal(
         ce,
         &topics,
@@ -253,6 +255,7 @@ where
         &handler,
         shutdown,
         Some(ready),
+        &declared,
     );
 
     // Run both to completion; each returns when the shared shutdown fires.
