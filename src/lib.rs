@@ -99,12 +99,6 @@ pub fn discover_api_token() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// Async client for a CE node. Speaks the HTTP API, and — targeting the LOCAL node on unix,
-/// when the node exposes `<data_dir>/lane.sock` — transparently rides the ce-lane shared-memory
-/// transport for the hot app-messaging paths (publish/send/request/reply/subscribe/stream),
-/// falling back to HTTP silently on any lane absence or failure. Same node-side `AppBus`
-/// either way, so apps observe identical behavior.
-#[derive(Debug, Clone)]
 /// Percent-encode a query-string value (topics are app-chosen strings; `/` and `.` are common).
 fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 8);
@@ -119,6 +113,12 @@ fn urlencode(s: &str) -> String {
     out
 }
 
+/// Async client for a CE node. Speaks the HTTP API, and — targeting the LOCAL node on unix,
+/// when the node exposes `<data_dir>/lane.sock` — transparently rides the ce-lane shared-memory
+/// transport for the hot app-messaging paths (publish/send/request/reply/subscribe/stream),
+/// falling back to HTTP silently on any lane absence or failure. Same node-side `AppBus`
+/// either way, so apps observe identical behavior.
+#[derive(Debug, Clone)]
 pub struct CeClient {
     base: String,
     http: reqwest::Client,
