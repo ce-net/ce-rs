@@ -118,6 +118,9 @@ where
 /// AND every subscribed topic has been CONFIRMED by the node (`/mesh/subscribe` returns
 /// synchronously — that is the confirmation). `capability::provide` gates its first DHT advertise
 /// on this, so a caller can never locate an instance whose node would still drop its requests.
+///
+/// `stream_topics` are the topics to ask the node to restrict this stream to. EMPTY = everything,
+/// which is the only safe default when `accept` may match topics that were never enumerated.
 pub(crate) async fn serve_where_signal<H, F>(
     ce: &CeClient,
     subscribe: &[&str],
@@ -125,8 +128,6 @@ pub(crate) async fn serve_where_signal<H, F>(
     handler: &H,
     shutdown: impl std::future::Future<Output = ()>,
     subscribed: Option<Arc<AtomicBool>>,
-    /// Topics to ask the node to restrict this stream to. EMPTY = everything, which is the only
-    /// safe default when `accept` may match topics that were never enumerated.
     stream_topics: &[String],
 ) -> Result<()>
 where
